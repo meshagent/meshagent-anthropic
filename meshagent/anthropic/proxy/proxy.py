@@ -25,7 +25,7 @@ def _redact_headers(headers: httpx.Headers) -> dict:
     return h
 
 
-def _truncate_bytes(b: bytes, limit: int = 4000) -> str:
+def _truncate_bytes(b: bytes, limit: int = 1024 * 100) -> str:
     s = b.decode("utf-8", errors="replace")
     return (
         s

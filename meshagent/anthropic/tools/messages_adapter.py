@@ -21,6 +21,7 @@ import os
 import logging
 import re
 import asyncio
+import base64
 
 from meshagent.anthropic.proxy import get_client, get_logging_httpx_client
 
@@ -150,7 +151,51 @@ class AnthropicMessagesToolResponseAdapter(ToolResponseAdapter):
             # Allow advanced tools to return pre-built Anthropic blocks.
             return [{"role": "user", "content": response.outputs}]
 
-        output = await self.to_plain_text(room=room, response=response)
+        tool_result_content: list[dict]
+
+        if isinstance(response, FileResponse):
+            mime_type = (response.mime_type or "").lower()
+
+            if mime_type == "image/jpg":
+                mime_type = "image/jpeg"
+
+            if mime_type.startswith("image/"):
+                allowed = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+                if mime_type not in allowed:
+                    output = f"{response.name} was returned as {response.mime_type}, which Anthropic does not accept as an image block"
+                    tool_result_content = [_text_block(output)]
+                else:
+                    tool_result_content = [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": mime_type,
+                                "data": base64.b64encode(response.data).decode("utf-8"),
+                            },
+                        }
+                    ]
+
+            elif mime_type == "application/pdf":
+                tool_result_content = [
+                    {
+                        "type": "document",
+                        "title": response.name,
+                        "source": {
+                            "type": "base64",
+                            "media_type": "application/pdf",
+                            "data": base64.b64encode(response.data).decode("utf-8"),
+                        },
+                    }
+                ]
+
+            else:
+                output = await self.to_plain_text(room=room, response=response)
+                tool_result_content = [_text_block(output)]
+
+        else:
+            output = await self.to_plain_text(room=room, response=response)
+            tool_result_content = [_text_block(output)]
 
         message = {
             "role": "user",
@@ -158,7 +203,7 @@ class AnthropicMessagesToolResponseAdapter(ToolResponseAdapter):
                 {
                     "type": "tool_result",
                     "tool_use_id": tool_use_id,
-                    "content": [_text_block(output)],
+                    "content": tool_result_content,
                 }
             ],
         }
@@ -210,22 +255,64 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
     ) -> tuple[list[dict], Optional[str]]:
         system = context.get_system_instructions()
 
+        def as_blocks(role: str, content: Any) -> dict:
+            if isinstance(content, str):
+                return {"role": role, "content": [_text_block(content)]}
+            if isinstance(content, list):
+                return {"role": role, "content": content}
+            return {"role": role, "content": [_text_block(str(content))]}
+
         messages: list[dict] = []
+        pending_tool_use_ids: set[str] = set()
+
         for m in context.messages:
-            if m.get("role") in {"user", "assistant"}:
-                content = m.get("content")
-                if isinstance(content, str):
-                    messages.append(
-                        {"role": m["role"], "content": [_text_block(content)]}
+            role = m.get("role")
+            if role not in {"user", "assistant"}:
+                continue
+
+            msg = as_blocks(role, m.get("content"))
+
+            # Anthropic requires that tool_result blocks appear in the *immediately next*
+            # user message after an assistant tool_use.
+            if pending_tool_use_ids:
+                if role == "assistant":
+                    # Drop any assistant chatter that appears between tool_use and tool_result.
+                    logger.warning(
+                        "dropping assistant message between tool_use and tool_result"
                     )
-                elif isinstance(content, list):
-                    # Allow passing through OpenAI-style image/file blocks if already present.
-                    # Tool adapters will also insert Anthropic blocks here.
-                    messages.append({"role": m["role"], "content": content})
-                else:
-                    messages.append(
-                        {"role": m["role"], "content": [_text_block(str(content))]}
+                    continue
+
+                # role == user
+                content_blocks = msg.get("content") or []
+                tool_results = [
+                    b
+                    for b in content_blocks
+                    if isinstance(b, dict) and b.get("type") == "tool_result"
+                ]
+                tool_result_ids = {
+                    b.get("tool_use_id") for b in tool_results if b.get("tool_use_id")
+                }
+
+                if not pending_tool_use_ids.issubset(tool_result_ids):
+                    # If we can't satisfy the ordering contract, it's better to fail early
+                    # with a clear error than to send an invalid request.
+                    raise RoomException(
+                        "invalid transcript: tool_use blocks must be followed by a user message "
+                        "containing tool_result blocks for all tool_use ids"
                     )
+
+                pending_tool_use_ids.clear()
+
+            # Track tool_use ids introduced by assistant messages.
+            if role == "assistant":
+                content_blocks = msg.get("content") or []
+                for b in content_blocks:
+                    if isinstance(b, dict) and b.get("type") == "tool_use":
+                        tool_id = b.get("id")
+                        if tool_id:
+                            pending_tool_use_ids.add(tool_id)
+
+            messages.append(msg)
 
         return messages, system
 
@@ -376,9 +463,35 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
                         tasks.append(asyncio.create_task(do_tool(tool_use)))
 
                     results = await asyncio.gather(*tasks)
+
+                    # Anthropic requires tool_result blocks for *all* tool_use ids to appear in the
+                    # *immediately next* user message after the assistant tool_use message.
+                    tool_result_blocks: list[dict] = []
+                    trailing_messages: list[dict] = []
+
                     for msgs in results:
                         for msg in msgs:
-                            context.messages.append(msg)
+                            if (
+                                isinstance(msg, dict)
+                                and msg.get("role") == "user"
+                                and isinstance(msg.get("content"), list)
+                                and all(
+                                    isinstance(b, dict)
+                                    and b.get("type") == "tool_result"
+                                    for b in msg["content"]
+                                )
+                            ):
+                                tool_result_blocks.extend(msg["content"])
+                            else:
+                                trailing_messages.append(msg)
+
+                    if tool_result_blocks:
+                        context.messages.append(
+                            {"role": "user", "content": tool_result_blocks}
+                        )
+
+                    for msg in trailing_messages:
+                        context.messages.append(msg)
 
                     continue
 
