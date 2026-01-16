@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from meshagent.agents.agent import AgentChatContext
 from meshagent.api import RoomClient, RoomException, RemoteParticipant
-from meshagent.tools import Toolkit, ToolContext, Tool
+from meshagent.tools import Toolkit, ToolContext, Tool, BaseTool
 from meshagent.api.messaging import (
     Response,
     LinkResponse,
@@ -24,6 +24,7 @@ import asyncio
 import base64
 
 from meshagent.anthropic.proxy import get_client, get_logging_httpx_client
+from meshagent.anthropic.mcp import MCPTool as MCPConnectorTool
 
 try:
     from anthropic import APIStatusError
@@ -316,12 +317,20 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
 
         return messages, system
 
-    async def _create_with_optional_headers(self, client: Any, **kwargs) -> Any:
+    def _messages_api(self, *, client: Any, request: dict) -> Any:
+        # The MCP connector requires `client.beta.messages.*`.
+        if request.get("betas") is not None:
+            return client.beta.messages
+        return client.messages
+
+    async def _create_with_optional_headers(self, *, client: Any, request: dict) -> Any:
+        api = self._messages_api(client=client, request=request)
         try:
-            return await client.messages.create(**kwargs)
+            return await api.create(**request)
         except TypeError:
-            kwargs.pop("extra_headers", None)
-            return await client.messages.create(**kwargs)
+            request = dict(request)
+            request.pop("extra_headers", None)
+            return await api.create(**request)
 
     async def _stream_message(
         self,
@@ -342,9 +351,10 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
         ```
         """
 
-        stream = client.messages.stream(**request)
+        api = self._messages_api(client=client, request=request)
+        stream_mgr = api.stream(**request)
 
-        async with stream:
+        async with stream_mgr as stream:
             async for event in stream:
                 event_handler({"type": event.type, "event": _as_jsonable(event)})
 
@@ -353,6 +363,49 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
             {"type": "message.completed", "message": _as_jsonable(final_message)}
         )
         return final_message
+
+    def _split_toolkits(
+        self, *, toolkits: list[Toolkit]
+    ) -> tuple[list[Toolkit], list[MCPConnectorTool]]:
+        """Split toolkits into executable tools and request middleware tools."""
+
+        executable_toolkits: list[Toolkit] = []
+        middleware: list[MCPConnectorTool] = []
+
+        for toolkit in toolkits:
+            executable_tools: list[Tool] = []
+
+            for t in toolkit.tools:
+                if isinstance(t, MCPConnectorTool):
+                    middleware.append(t)
+                elif isinstance(t, Tool):
+                    executable_tools.append(t)
+                elif isinstance(t, BaseTool):
+                    # Non-executable tool types are ignored.
+                    continue
+                else:
+                    raise RoomException(f"unsupported tool type {type(t)}")
+
+            if executable_tools:
+                executable_toolkits.append(
+                    Toolkit(
+                        name=toolkit.name,
+                        title=getattr(toolkit, "title", None),
+                        description=getattr(toolkit, "description", None),
+                        thumbnail_url=getattr(toolkit, "thumbnail_url", None),
+                        rules=getattr(toolkit, "rules", []),
+                        tools=executable_tools,
+                    )
+                )
+
+        return executable_toolkits, middleware
+
+    def _apply_request_middleware(
+        self, *, request: dict, middleware: list[MCPConnectorTool]
+    ) -> dict:
+        for m in middleware:
+            m.apply(request=request)
+        return request
 
     async def next(
         self,
@@ -378,8 +431,10 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
 
         try:
             while True:
-                tool_bundle = MessagesToolBundle(toolkits=toolkits)
-                tools = tool_bundle.to_json()
+                executable_toolkits, middleware = self._split_toolkits(
+                    toolkits=toolkits
+                )
+                tool_bundle = MessagesToolBundle(toolkits=executable_toolkits)
 
                 messages, system = self._convert_messages(context=context)
 
@@ -399,15 +454,44 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
                         on_behalf_of.get_attribute("name")
                     )
 
+                message_options = dict(self._message_options or {})
+
+                tools_list: list[dict] = tool_bundle.to_json() or []
+                extra_tools = message_options.pop("tools", None)
+                if isinstance(extra_tools, list):
+                    tools_list.extend(extra_tools)
+
                 request = {
                     "model": model,
                     "max_tokens": self._max_tokens,
                     "messages": messages,
                     "system": system,
-                    "tools": tools,
+                    "tools": tools_list,
                     "extra_headers": extra_headers or None,
-                    **(self._message_options or {}),
+                    **message_options,
                 }
+
+                request = self._apply_request_middleware(
+                    request=request,
+                    middleware=middleware,
+                )
+
+                # Normalize empty lists to None for Anthropic.
+                if (
+                    isinstance(request.get("tools"), list)
+                    and len(request["tools"]) == 0
+                ):
+                    request["tools"] = None
+                if (
+                    isinstance(request.get("mcp_servers"), list)
+                    and len(request["mcp_servers"]) == 0
+                ):
+                    request["mcp_servers"] = None
+                if (
+                    isinstance(request.get("betas"), list)
+                    and len(request["betas"]) == 0
+                ):
+                    request["betas"] = None
 
                 # remove None fields
                 request = {k: v for k, v in request.items() if v is not None}
@@ -423,7 +507,8 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
                     response_dict = _as_jsonable(final_message)
                 else:
                     response = await self._create_with_optional_headers(
-                        client, **request
+                        client=client,
+                        request=request,
                     )
                     response_dict = _as_jsonable(response)
 
