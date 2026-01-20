@@ -153,50 +153,56 @@ class AnthropicMessagesToolResponseAdapter(ToolResponseAdapter):
             return [{"role": "user", "content": response.outputs}]
 
         tool_result_content: list[dict]
+        try:
+            if isinstance(response, FileResponse):
+                mime_type = (response.mime_type or "").lower()
 
-        if isinstance(response, FileResponse):
-            mime_type = (response.mime_type or "").lower()
+                if mime_type == "image/jpg":
+                    mime_type = "image/jpeg"
 
-            if mime_type == "image/jpg":
-                mime_type = "image/jpeg"
+                if mime_type.startswith("image/"):
+                    allowed = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+                    if mime_type not in allowed:
+                        output = f"{response.name} was returned as {response.mime_type}, which Anthropic does not accept as an image block"
+                        tool_result_content = [_text_block(output)]
+                    else:
+                        tool_result_content = [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": mime_type,
+                                    "data": base64.b64encode(response.data).decode(
+                                        "utf-8"
+                                    ),
+                                },
+                            }
+                        ]
 
-            if mime_type.startswith("image/"):
-                allowed = {"image/jpeg", "image/png", "image/gif", "image/webp"}
-                if mime_type not in allowed:
-                    output = f"{response.name} was returned as {response.mime_type}, which Anthropic does not accept as an image block"
-                    tool_result_content = [_text_block(output)]
-                else:
+                elif mime_type == "application/pdf":
                     tool_result_content = [
                         {
-                            "type": "image",
+                            "type": "document",
+                            "title": response.name,
                             "source": {
                                 "type": "base64",
-                                "media_type": mime_type,
+                                "media_type": "application/pdf",
                                 "data": base64.b64encode(response.data).decode("utf-8"),
                             },
                         }
                     ]
 
-            elif mime_type == "application/pdf":
-                tool_result_content = [
-                    {
-                        "type": "document",
-                        "title": response.name,
-                        "source": {
-                            "type": "base64",
-                            "media_type": "application/pdf",
-                            "data": base64.b64encode(response.data).decode("utf-8"),
-                        },
-                    }
-                ]
+                else:
+                    output = await self.to_plain_text(room=room, response=response)
+                    tool_result_content = [_text_block(output)]
 
             else:
                 output = await self.to_plain_text(room=room, response=response)
                 tool_result_content = [_text_block(output)]
 
-        else:
-            output = await self.to_plain_text(room=room, response=response)
-            tool_result_content = [_text_block(output)]
+        except Exception as ex:
+            logger.error("unable to process tool call results", exc_info=ex)
+            tool_result_content = [_text_block(f"Error: {ex}")]
 
         message = {
             "role": "user",
@@ -533,16 +539,30 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
                             on_behalf_of=on_behalf_of,
                             caller_context={"chat": context.to_json()},
                         )
-                        tool_response = await tool_bundle.execute(
-                            context=tool_context,
-                            tool_use=tool_use,
-                        )
-                        return await tool_adapter.create_messages(
-                            context=context,
-                            tool_call=tool_use,
-                            room=room,
-                            response=tool_response,
-                        )
+                        try:
+                            tool_response = await tool_bundle.execute(
+                                context=tool_context,
+                                tool_use=tool_use,
+                            )
+                            return await tool_adapter.create_messages(
+                                context=context,
+                                tool_call=tool_use,
+                                room=room,
+                                response=tool_response,
+                            )
+                        except Exception as ex:
+                            tool_result_content = [_text_block(f"Error: {ex}")]
+                            message = {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "tool_result",
+                                        "tool_use_id": tool_use.get("id"),
+                                        "content": tool_result_content,
+                                    }
+                                ],
+                            }
+                            return [message]
 
                     for tool_use in tool_uses:
                         tasks.append(asyncio.create_task(do_tool(tool_use)))
