@@ -567,6 +567,10 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
                                 response=tool_response,
                             )
                         except Exception as ex:
+                            logger.error(
+                                f"error in tool call {tool_use.get('name')}:",
+                                exc_info=ex,
+                            )
                             tool_result_content = [_text_block(f"Error: {ex}")]
                             message = {
                                 "role": "user",
