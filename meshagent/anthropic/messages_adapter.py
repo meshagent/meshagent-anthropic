@@ -372,11 +372,11 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
 
     def _split_toolkits(
         self, *, toolkits: list[Toolkit]
-    ) -> tuple[list[Toolkit], list[MCPConnectorTool]]:
+    ) -> tuple[list[Toolkit], list[BaseTool]]:
         """Split toolkits into executable tools and request middleware tools."""
 
         executable_toolkits: list[Toolkit] = []
-        middleware: list[MCPConnectorTool] = []
+        middleware: list[BaseTool] = []
 
         for toolkit in toolkits:
             executable_tools: list[Tool] = []
@@ -387,6 +387,8 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
                 elif isinstance(t, Tool):
                     executable_tools.append(t)
                 elif isinstance(t, BaseTool):
+                    if hasattr(t, "apply") and callable(getattr(t, "apply")):
+                        middleware.append(t)
                     # Non-executable tool types are ignored.
                     continue
                 else:
@@ -407,10 +409,12 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
         return executable_toolkits, middleware
 
     def _apply_request_middleware(
-        self, *, request: dict, middleware: list[MCPConnectorTool]
+        self, *, request: dict, middleware: list[BaseTool]
     ) -> dict:
         for m in middleware:
-            m.apply(request=request)
+            apply = getattr(m, "apply", None)
+            if callable(apply):
+                apply(request=request)
         return request
 
     async def next(

@@ -11,6 +11,7 @@ from .mcp import (
     MCPToolkitBuilder,
 )
 from .openai_responses_stream_adapter import AnthropicOpenAIResponsesStreamAdapter
+from .web_search import WebSearchConfig, WebSearchTool, WebSearchToolkitBuilder
 
 __all__ = [
     AnthropicMessagesAdapter,
@@ -22,4 +23,7 @@ __all__ = [
     MCPToolConfig,
     MCPToolset,
     MCPToolkitBuilder,
+    WebSearchConfig,
+    WebSearchTool,
+    WebSearchToolkitBuilder,
 ]
