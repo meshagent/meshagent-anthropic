@@ -4,7 +4,9 @@ from typing import Literal, Optional
 
 from pydantic import BaseModel
 
-from meshagent.tools import BaseTool, Toolkit, ToolkitBuilder, ToolkitConfig
+from meshagent.tools import Toolkit, ToolkitBuilder, ToolkitConfig
+
+from .request_tool import AnthropicRequestTool
 
 
 # This module wraps Anthropic's official MCP connector support:
@@ -56,21 +58,17 @@ class MCPConfig(ToolkitConfig):
     betas: list[str] = [MCP_CONNECTOR_BETA]
 
 
-class MCPTool(BaseTool):
+class MCPTool(AnthropicRequestTool):
     """Non-executable tool that augments the Anthropic request."""
 
     def __init__(self, *, config: MCPConfig):
         super().__init__(name="mcp")
         self.config = config
 
-    def apply(self, *, request: dict) -> None:
+    def apply(self, *, request: dict, headers: dict) -> None:
         """Mutate an Anthropic Messages request in-place."""
 
-        # Ensure we use the beta Messages API surface.
-        betas = request.setdefault("betas", [])
-        for b in self.config.betas:
-            if b not in betas:
-                betas.append(b)
+        self.apply_betas(headers=headers, betas=self.config.betas)
 
         toolsets = self.config.toolsets
         if toolsets is None:

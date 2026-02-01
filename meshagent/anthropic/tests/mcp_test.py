@@ -11,9 +11,10 @@ def test_mcp_tool_apply_injects_servers_toolsets_and_beta():
 
     tool = MCPTool(config=cfg)
     request: dict = {"tools": []}
-    tool.apply(request=request)
+    headers: dict = {}
+    tool.apply(request=request, headers=headers)
 
-    assert request["betas"] == ["mcp-client-2025-11-20"]
+    assert headers["anthropic-beta"] == "mcp-client-2025-11-20"
     assert request["mcp_servers"] == [
         {
             "type": "url",
@@ -45,14 +46,16 @@ def test_mcp_tool_apply_dedupes_servers_by_name_and_preserves_existing():
                 "authorization_token": "OLD",
             }
         ],
-        "betas": ["some-other-beta"],
     }
 
-    tool.apply(request=request)
+    headers: dict = {"anthropic-beta": "some-other-beta"}
+
+    tool.apply(request=request, headers=headers)
 
     # Keeps existing betas and appends MCP beta.
-    assert "some-other-beta" in request["betas"]
-    assert "mcp-client-2025-11-20" in request["betas"]
+    betas = {b.strip() for b in headers["anthropic-beta"].split(",") if b.strip()}
+    assert "some-other-beta" in betas
+    assert "mcp-client-2025-11-20" in betas
 
     # Dedupes by name; cfg overwrites the existing server entry.
     by_name = {s["name"]: s for s in request["mcp_servers"]}

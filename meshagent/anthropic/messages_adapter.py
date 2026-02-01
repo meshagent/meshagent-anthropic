@@ -327,6 +327,9 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
         # The MCP connector requires `client.beta.messages.*`.
         if request.get("betas") is not None:
             return client.beta.messages
+        extra_headers = request.get("extra_headers")
+        if isinstance(extra_headers, dict) and extra_headers.get("anthropic-beta"):
+            return client.beta.messages
         return client.messages
 
     async def _create_with_optional_headers(self, *, client: Any, request: dict) -> Any:
@@ -411,10 +414,15 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
     def _apply_request_middleware(
         self, *, request: dict, middleware: list[BaseTool]
     ) -> dict:
+        headers = request.get("extra_headers") or {}
         for m in middleware:
             apply = getattr(m, "apply", None)
             if callable(apply):
-                apply(request=request)
+                try:
+                    apply(request=request, headers=headers)
+                except TypeError:
+                    apply(request=request)
+        request["extra_headers"] = headers or None
         return request
 
     async def next(
