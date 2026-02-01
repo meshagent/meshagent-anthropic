@@ -46,7 +46,11 @@ def safe_tool_name(name: str) -> str:
 def _as_jsonable(obj: Any) -> Any:
     if isinstance(obj, dict):
         return obj
-    return obj.model_dump(mode="json")
+    return obj.model_dump(
+        mode="json",
+        exclude_none=True,
+        exclude_unset=True,
+    )
 
 
 def _text_block(text: str) -> dict:

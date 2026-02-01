@@ -114,7 +114,11 @@ class AnthropicOpenAIResponsesStreamAdapter(AnthropicMessagesAdapter):
 
         async with client.messages.stream(**request) as stream:
             async for event in stream:
-                data = event.model_dump(mode="json")
+                data = event.model_dump(
+                    mode="json",
+                    exclude_none=True,
+                    exclude_unset=True,
+                )
                 etype = data.get("type")
 
                 if etype == "message_start":
@@ -356,7 +360,11 @@ class AnthropicOpenAIResponsesStreamAdapter(AnthropicMessagesAdapter):
                     continue
 
         final_message = await stream.get_final_message()
-        final_dict = final_message.model_dump(mode="json")
+        final_dict = final_message.model_dump(
+            mode="json",
+            exclude_none=True,
+            exclude_unset=True,
+        )
         usage = final_dict.get("usage") or {}
         input_tokens = usage.get("input_tokens")
         output_tokens = usage.get("output_tokens")
