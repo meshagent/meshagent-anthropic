@@ -196,6 +196,9 @@ class AnthropicMessagesToolResponseAdapter(ToolResponseAdapter):
                         }
                     ]
 
+                elif mime_type.startswith("text/") or mime_type == "application/json":
+                    tool_result_content = [_text_block(response.data.decode())]
+
                 else:
                     output = await self.to_plain_text(room=room, response=response)
                     tool_result_content = [_text_block(output)]
@@ -236,7 +239,7 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
     def __init__(
         self,
         model: str = os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-latest"),
-        max_tokens: int = int(os.getenv("ANTHROPIC_MAX_TOKENS", "1024")),
+        max_tokens: int = int(os.getenv("ANTHROPIC_MAX_TOKENS", "8192")),
         client: Optional[Any] = None,
         message_options: Optional[dict] = None,
         provider: str = "anthropic",
@@ -568,7 +571,7 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
                             )
                         except Exception as ex:
                             logger.error(
-                                f"error in tool call {tool_use.get('name')}:",
+                                f"error in tool call {json.dumps(tool_use)}:",
                                 exc_info=ex,
                             )
                             tool_result_content = [_text_block(f"Error: {ex}")]
