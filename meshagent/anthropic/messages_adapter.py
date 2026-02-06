@@ -463,16 +463,6 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
 
                 messages, system = self._convert_messages(context=context)
 
-                if output_schema is not None:
-                    schema_hint = json.dumps(output_schema)
-                    schema_system = (
-                        "Return ONLY valid JSON that matches this JSON Schema. "
-                        "Do not wrap in markdown. Schema: " + schema_hint
-                    )
-                    system = (
-                        (system + "\n" + schema_system) if system else schema_system
-                    )
-
                 extra_headers = {}
                 if on_behalf_of is not None:
                     extra_headers["Meshagent-On-Behalf-Of"] = (
@@ -495,6 +485,11 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
                     "extra_headers": extra_headers or None,
                     **message_options,
                 }
+
+                if output_schema is not None:
+                    request["output_config"] = {
+                        "format": {"type": "json_schema", "schema": output_schema}
+                    }
 
                 request = self._apply_request_middleware(
                     request=request,
@@ -639,7 +634,6 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
                 validation_attempts += 1
                 try:
                     parsed = json.loads(text)
-                    self.validate(response=parsed, output_schema=output_schema)
                     return parsed
                 except Exception as e:
                     if validation_attempts >= 3:
