@@ -22,6 +22,7 @@ import logging
 import re
 import asyncio
 import base64
+from html_to_markdown import convert
 
 from meshagent.anthropic.proxy import get_client, get_logging_httpx_client
 from meshagent.anthropic.mcp import MCPTool as MCPConnectorTool
@@ -32,6 +33,17 @@ except Exception:  # pragma: no cover
     APIStatusError = Exception  # type: ignore
 
 logger = logging.getLogger("anthropic_agent")
+
+
+def _is_html_mime_type(mime_type: str | None) -> bool:
+    if not mime_type:
+        return False
+    normalized = mime_type.split(";")[0].strip().lower()
+    return normalized in {"text/html", "application/xhtml+xml"}
+
+
+def _decode_text(data: bytes) -> str:
+    return data.decode("utf-8", errors="replace")
 
 
 def _replace_non_matching(text: str, allowed_chars: str, replacement: str) -> str:
@@ -196,8 +208,16 @@ class AnthropicMessagesToolResponseAdapter(ToolResponseAdapter):
                         }
                     ]
 
-                elif mime_type.startswith("text/") or mime_type == "application/json":
-                    tool_result_content = [_text_block(response.data.decode())]
+                elif (
+                    mime_type.startswith("text/")
+                    or mime_type == "application/json"
+                    or mime_type == "application/xhtml+xml"
+                ):
+                    if _is_html_mime_type(mime_type):
+                        text = convert(_decode_text(response.data))
+                    else:
+                        text = _decode_text(response.data)
+                    tool_result_content = [_text_block(text)]
 
                 else:
                     output = await self.to_plain_text(room=room, response=response)
