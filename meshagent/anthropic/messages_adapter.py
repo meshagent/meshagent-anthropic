@@ -69,6 +69,111 @@ def _text_block(text: str) -> dict:
     return {"type": "text", "text": text}
 
 
+class AnthropicMessagesChatContext(AgentChatContext):
+    @property
+    def supports_images(self) -> bool:
+        return True
+
+    @property
+    def supports_files(self) -> bool:
+        return True
+
+    def append_image_message(self, *, mime_type: str, data: bytes) -> dict:
+        normalized_mime_type = mime_type.lower().strip()
+        if normalized_mime_type == "image/jpg":
+            normalized_mime_type = "image/jpeg"
+
+        allowed_mime_types = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+        if normalized_mime_type not in allowed_mime_types:
+            message = {
+                "role": "user",
+                "content": [
+                    _text_block(
+                        f"the user attached an image in unsupported format {normalized_mime_type}"
+                    )
+                ],
+            }
+            self.messages.append(message)
+            return message
+
+        message = {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": normalized_mime_type,
+                        "data": base64.b64encode(data).decode("utf-8"),
+                    },
+                }
+            ],
+        }
+        self.messages.append(message)
+        return message
+
+    def append_file_message(
+        self, *, filename: str, mime_type: str, data: bytes
+    ) -> dict:
+        normalized_mime_type = (mime_type or "application/octet-stream").lower().strip()
+
+        if normalized_mime_type.startswith("image/"):
+            return self.append_image_message(
+                mime_type=normalized_mime_type,
+                data=data,
+            )
+
+        if normalized_mime_type == "application/pdf":
+            message = {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "document",
+                        "title": filename,
+                        "source": {
+                            "type": "base64",
+                            "media_type": normalized_mime_type,
+                            "data": base64.b64encode(data).decode("utf-8"),
+                        },
+                    }
+                ],
+            }
+            self.messages.append(message)
+            return message
+
+        if (
+            normalized_mime_type.startswith("text/")
+            or normalized_mime_type == "application/json"
+            or normalized_mime_type == "application/xhtml+xml"
+        ):
+            if _is_html_mime_type(normalized_mime_type):
+                text = convert(_decode_text(data))
+            else:
+                text = _decode_text(data)
+
+            message = {
+                "role": "user",
+                "content": [
+                    _text_block(
+                        f"attached file {filename} ({normalized_mime_type}):\n{text}"
+                    )
+                ],
+            }
+            self.messages.append(message)
+            return message
+
+        message = {
+            "role": "user",
+            "content": [
+                _text_block(
+                    f"the user attached a file named {filename} with mime type {normalized_mime_type}"
+                )
+            ],
+        }
+        self.messages.append(message)
+        return message
+
+
 class MessagesToolBundle:
     def __init__(self, toolkits: list[Toolkit]):
         self._executors: dict[str, Toolkit] = {}
@@ -276,7 +381,7 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
         return self._model
 
     def create_chat_context(self) -> AgentChatContext:
-        return AgentChatContext(system_role=None)
+        return AnthropicMessagesChatContext(system_role=None)
 
     def get_anthropic_client(self, *, room: RoomClient) -> Any:
         if self._client is not None:

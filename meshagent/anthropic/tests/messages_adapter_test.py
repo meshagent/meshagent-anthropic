@@ -177,3 +177,21 @@ async def test_next_batches_multiple_tool_results_into_single_user_message():
         "toolu_1",
         "toolu_2",
     }
+
+
+def test_create_chat_context_supports_images_and_files() -> None:
+    adapter = AnthropicMessagesAdapter(client=object())
+    context = adapter.create_chat_context()
+
+    assert context.supports_images is True
+    assert context.supports_files is True
+
+    image_message = context.append_image_message(mime_type="image/png", data=b"png")
+    assert image_message["content"][0]["type"] == "image"
+
+    file_message = context.append_file_message(
+        filename="file.pdf",
+        mime_type="application/pdf",
+        data=b"%PDF-1.7",
+    )
+    assert file_message["content"][0]["type"] == "document"
