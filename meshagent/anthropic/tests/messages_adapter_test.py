@@ -1,7 +1,11 @@
 import pytest
 
-from meshagent.anthropic.messages_adapter import AnthropicMessagesAdapter
+from meshagent.anthropic.messages_adapter import (
+    AnthropicMessagesAdapter,
+    _consume_streaming_tool_result,
+)
 from meshagent.agents.agent import AgentChatContext
+from meshagent.api.messaging import JsonChunk, TextChunk
 from meshagent.tools import Tool, Toolkit
 from meshagent.api import RoomException
 from meshagent.agents.adapter import ToolResponseAdapter
@@ -53,6 +57,33 @@ class _ToolResultAdapter(ToolResponseAdapter):
         ]
 
 
+class _CaptureToolResultAdapter(ToolResponseAdapter):
+    def __init__(self):
+        self.responses: list[object] = []
+
+    async def to_plain_text(self, *, room, response):
+        del room
+        self.responses.append(response)
+        return "ok"
+
+    async def create_messages(self, *, context, tool_call, room, response):
+        del context
+        del room
+        self.responses.append(response)
+        return [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_call["id"],
+                        "content": [{"type": "text", "text": "ok"}],
+                    }
+                ],
+            }
+        ]
+
+
 class _FakeAdapter(AnthropicMessagesAdapter):
     def __init__(self, responses: list[dict]):
         super().__init__(client=object())
@@ -65,6 +96,25 @@ class _FakeAdapter(AnthropicMessagesAdapter):
         resp = self._responses[self._idx]
         self._idx += 1
         return resp
+
+
+class _StreamingTool(Tool):
+    def __init__(self, name: str):
+        super().__init__(
+            name=name,
+            input_schema={"type": "object", "additionalProperties": True},
+            description="streaming test tool",
+        )
+
+    async def execute(self, context, **kwargs):
+        del context
+        del kwargs
+
+        async def _run():
+            yield JsonChunk(json={"type": "agent.event", "headline": "working"})
+            yield TextChunk(text="tool-final")
+
+        return _run()
 
 
 def test_convert_messages_drops_assistant_between_tool_use_and_tool_result():
@@ -179,6 +229,39 @@ async def test_next_batches_multiple_tool_results_into_single_user_message():
     }
 
 
+@pytest.mark.asyncio
+async def test_next_uses_final_stream_item_as_tool_result() -> None:
+    responses = [
+        {
+            "content": [
+                {"type": "text", "text": "calling tool"},
+                {"type": "tool_use", "id": "toolu_1", "name": "tool_a", "input": {}},
+            ]
+        },
+        {"content": [{"type": "text", "text": "done"}]},
+    ]
+
+    adapter = _FakeAdapter(responses=responses)
+    ctx = AgentChatContext(system_role=None)
+    ctx.append_user_message("run tool")
+
+    toolkit = Toolkit(name="test", tools=[_StreamingTool("tool_a")])
+    capture_tool_adapter = _CaptureToolResultAdapter()
+
+    result = await adapter.next(
+        context=ctx,
+        room=_DummyRoom(),
+        toolkits=[toolkit],
+        tool_adapter=capture_tool_adapter,
+    )
+
+    assert result == "done"
+    assert len(capture_tool_adapter.responses) == 1
+    response = capture_tool_adapter.responses[0]
+    assert isinstance(response, TextChunk)
+    assert response.text == "tool-final"
+
+
 def test_create_chat_context_supports_images_and_files() -> None:
     adapter = AnthropicMessagesAdapter(client=object())
     context = adapter.create_chat_context()
@@ -195,3 +278,51 @@ def test_create_chat_context_supports_images_and_files() -> None:
         data=b"%PDF-1.7",
     )
     assert file_message["content"][0]["type"] == "document"
+
+
+class _ToolItemStream:
+    def __init__(self, *, items: list[object]):
+        self._items = items
+
+    def __aiter__(self):
+        return self._run()
+
+    async def _run(self):
+        for item in self._items:
+            yield item
+
+
+@pytest.mark.asyncio
+async def test_consume_streaming_tool_result_emits_intermediate_json_chunk_events():
+    events: list[dict] = []
+    result = await _consume_streaming_tool_result(
+        stream=_ToolItemStream(
+            items=[
+                JsonChunk(json={"type": "agent.event", "headline": "working"}),
+                TextChunk(text="done"),
+            ]
+        ),
+        event_handler=events.append,
+    )
+
+    assert events == [{"type": "agent.event", "headline": "working"}]
+    assert isinstance(result, TextChunk)
+    assert result.text == "done"
+
+
+@pytest.mark.asyncio
+async def test_consume_streaming_tool_result_uses_final_item_as_result():
+    events: list[dict] = []
+    result = await _consume_streaming_tool_result(
+        stream=_ToolItemStream(
+            items=[
+                JsonChunk(json={"progress": 1}),
+                JsonChunk(json={"ok": True}),
+            ]
+        ),
+        event_handler=events.append,
+    )
+
+    assert events == [{"progress": 1}]
+    assert isinstance(result, JsonChunk)
+    assert result.json == {"ok": True}

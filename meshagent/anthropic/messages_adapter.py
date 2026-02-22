@@ -4,19 +4,20 @@ from meshagent.agents.agent import AgentChatContext
 from meshagent.api import RoomClient, RoomException, RemoteParticipant
 from meshagent.tools import Toolkit, ToolContext, Tool, BaseTool
 from meshagent.api.messaging import (
-    Response,
-    LinkResponse,
-    FileResponse,
-    JsonResponse,
-    TextResponse,
-    EmptyResponse,
-    RawOutputs,
+    Chunk,
+    LinkChunk,
+    FileChunk,
+    JsonChunk,
+    TextChunk,
+    EmptyChunk,
+    RawOutputsChunk,
     ensure_response,
 )
 from meshagent.agents.adapter import ToolResponseAdapter, LLMAdapter
 
 import json
 from typing import Any, Optional, Callable
+from collections.abc import AsyncIterable
 import os
 import logging
 import re
@@ -67,6 +68,28 @@ def _as_jsonable(obj: Any) -> Any:
 
 def _text_block(text: str) -> dict:
     return {"type": "text", "text": text}
+
+
+async def _consume_streaming_tool_result(
+    *, stream: AsyncIterable[Any], event_handler: Optional[Callable[[dict], None]]
+) -> Chunk:
+    has_last = False
+    last_item: Any = None
+    async for item in stream:
+        if has_last and isinstance(last_item, JsonChunk) and event_handler is not None:
+            event_handler(last_item.json)
+        last_item = item
+        has_last = True
+
+    if not has_last:
+        return ensure_response(None)
+
+    if isinstance(last_item, dict):
+        last_type = last_item.get("type")
+        if last_type in ("agent.event", "codex.event"):
+            return ensure_response(None)
+
+    return ensure_response(last_item)
 
 
 class AnthropicMessagesChatContext(AgentChatContext):
@@ -219,7 +242,9 @@ class MessagesToolBundle:
     def get_tool(self, safe_name: str) -> Tool | None:
         return self._tools_by_safe_name.get(safe_name)
 
-    async def execute(self, *, context: ToolContext, tool_use: dict) -> Response:
+    async def execute(
+        self, *, context: ToolContext, tool_use: dict
+    ) -> Chunk | AsyncIterable[Any]:
         safe_name = tool_use.get("name")
         if safe_name not in self._safe_names:
             raise RoomException(
@@ -233,20 +258,20 @@ class MessagesToolBundle:
         arguments = tool_use.get("input") or {}
         proxy = self._executors[name]
         result = await proxy.execute(context=context, name=name, arguments=arguments)
-        return ensure_response(result)
+        return result
 
 
 class AnthropicMessagesToolResponseAdapter(ToolResponseAdapter):
-    async def to_plain_text(self, *, room: RoomClient, response: Response) -> str:
-        if isinstance(response, LinkResponse):
+    async def to_plain_text(self, *, room: RoomClient, response: Chunk) -> str:
+        if isinstance(response, LinkChunk):
             return json.dumps({"name": response.name, "url": response.url})
-        if isinstance(response, JsonResponse):
+        if isinstance(response, JsonChunk):
             return json.dumps(response.json)
-        if isinstance(response, TextResponse):
+        if isinstance(response, TextChunk):
             return response.text
-        if isinstance(response, FileResponse):
+        if isinstance(response, FileChunk):
             return response.name
-        if isinstance(response, EmptyResponse):
+        if isinstance(response, EmptyChunk):
             return "ok"
         if isinstance(response, dict):
             return json.dumps(response)
@@ -262,20 +287,20 @@ class AnthropicMessagesToolResponseAdapter(ToolResponseAdapter):
         context: AgentChatContext,
         tool_call: Any,
         room: RoomClient,
-        response: Response,
+        response: Chunk,
     ) -> list:
         tool_use = tool_call if isinstance(tool_call, dict) else _as_jsonable(tool_call)
         tool_use_id = tool_use.get("id")
         if tool_use_id is None:
             raise RoomException("anthropic tool_use block was missing an id")
 
-        if isinstance(response, RawOutputs):
+        if isinstance(response, RawOutputsChunk):
             # Allow advanced tools to return pre-built Anthropic blocks.
             return [{"role": "user", "content": response.outputs}]
 
         tool_result_content: list[dict]
         try:
-            if isinstance(response, FileResponse):
+            if isinstance(response, FileChunk):
                 mime_type = (response.mime_type or "").lower()
 
                 if mime_type == "image/jpg":
@@ -683,6 +708,13 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
                                 context=tool_context,
                                 tool_use=tool_use,
                             )
+                            if isinstance(tool_response, AsyncIterable):
+                                tool_response = await _consume_streaming_tool_result(
+                                    stream=tool_response,
+                                    event_handler=event_handler,
+                                )
+                            else:
+                                tool_response = ensure_response(tool_response)
                             return await tool_adapter.create_messages(
                                 context=context,
                                 tool_call=tool_use,
