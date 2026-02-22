@@ -5,7 +5,7 @@ from meshagent.anthropic.messages_adapter import (
     _consume_streaming_tool_result,
 )
 from meshagent.agents.agent import AgentChatContext
-from meshagent.api.messaging import JsonChunk, TextChunk
+from meshagent.api.messaging import JsonContent, TextContent
 from meshagent.tools import Tool, Toolkit
 from meshagent.api import RoomException
 from meshagent.agents.adapter import ToolResponseAdapter
@@ -111,8 +111,8 @@ class _StreamingTool(Tool):
         del kwargs
 
         async def _run():
-            yield JsonChunk(json={"type": "agent.event", "headline": "working"})
-            yield TextChunk(text="tool-final")
+            yield JsonContent(json={"type": "agent.event", "headline": "working"})
+            yield TextContent(text="tool-final")
 
         return _run()
 
@@ -258,7 +258,7 @@ async def test_next_uses_final_stream_item_as_tool_result() -> None:
     assert result == "done"
     assert len(capture_tool_adapter.responses) == 1
     response = capture_tool_adapter.responses[0]
-    assert isinstance(response, TextChunk)
+    assert isinstance(response, TextContent)
     assert response.text == "tool-final"
 
 
@@ -298,15 +298,15 @@ async def test_consume_streaming_tool_result_emits_intermediate_json_chunk_event
     result = await _consume_streaming_tool_result(
         stream=_ToolItemStream(
             items=[
-                JsonChunk(json={"type": "agent.event", "headline": "working"}),
-                TextChunk(text="done"),
+                JsonContent(json={"type": "agent.event", "headline": "working"}),
+                TextContent(text="done"),
             ]
         ),
         event_handler=events.append,
     )
 
     assert events == [{"type": "agent.event", "headline": "working"}]
-    assert isinstance(result, TextChunk)
+    assert isinstance(result, TextContent)
     assert result.text == "done"
 
 
@@ -316,13 +316,13 @@ async def test_consume_streaming_tool_result_uses_final_item_as_result():
     result = await _consume_streaming_tool_result(
         stream=_ToolItemStream(
             items=[
-                JsonChunk(json={"progress": 1}),
-                JsonChunk(json={"ok": True}),
+                JsonContent(json={"progress": 1}),
+                JsonContent(json={"ok": True}),
             ]
         ),
         event_handler=events.append,
     )
 
     assert events == [{"progress": 1}]
-    assert isinstance(result, JsonChunk)
+    assert isinstance(result, JsonContent)
     assert result.json == {"ok": True}
