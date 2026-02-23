@@ -6,7 +6,7 @@ from meshagent.anthropic.messages_adapter import (
 )
 from meshagent.agents.agent import AgentChatContext
 from meshagent.api.messaging import JsonContent, TextContent
-from meshagent.tools import Tool, Toolkit
+from meshagent.tools import FunctionTool, Toolkit
 from meshagent.api import RoomException
 from meshagent.agents.adapter import ToolResponseAdapter
 
@@ -26,7 +26,7 @@ class _DummyRoom:
         self.local_participant = _DummyParticipant()
 
 
-class _AnyArgsTool(Tool):
+class _AnyArgsTool(FunctionTool):
     def __init__(self, name: str):
         super().__init__(
             name=name,
@@ -98,7 +98,7 @@ class _FakeAdapter(AnthropicMessagesAdapter):
         return resp
 
 
-class _StreamingTool(Tool):
+class _StreamingTool(FunctionTool):
     def __init__(self, name: str):
         super().__init__(
             name=name,

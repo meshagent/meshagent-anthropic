@@ -32,7 +32,7 @@ class AnthropicOpenAIResponsesStreamAdapter(AnthropicMessagesAdapter):
 
     Notes:
     - This adapter only affects the *streaming* event shape.
-    - Tool execution still uses MeshAgent toolkits and the Anthropic tool loop.
+    - FunctionTool execution still uses MeshAgent toolkits and the Anthropic tool loop.
     """
 
     async def _stream_message(

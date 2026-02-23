@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from meshagent.agents.agent import AgentChatContext
 from meshagent.api import RoomClient, RoomException, RemoteParticipant
-from meshagent.tools import Toolkit, ToolContext, Tool, BaseTool
+from meshagent.tools import Toolkit, ToolContext, FunctionTool, BaseTool
 from meshagent.api.messaging import (
     Content,
     LinkContent,
@@ -205,13 +205,13 @@ class MessagesToolBundle:
     def __init__(self, toolkits: list[Toolkit]):
         self._executors: dict[str, Toolkit] = {}
         self._safe_names: dict[str, str] = {}
-        self._tools_by_safe_name: dict[str, Tool] = {}
+        self._tools_by_safe_name: dict[str, FunctionTool] = {}
 
         tools: list[dict] = []
 
         for toolkit in toolkits:
             for v in toolkit.tools:
-                if not isinstance(v, Tool):
+                if not isinstance(v, FunctionTool):
                     raise RoomException(f"unsupported tool type {type(v)}")
 
                 original_name = v.name
@@ -243,7 +243,7 @@ class MessagesToolBundle:
     def to_json(self) -> list[dict] | None:
         return None if self._tools is None else self._tools.copy()
 
-    def get_tool(self, safe_name: str) -> Tool | None:
+    def get_tool(self, safe_name: str) -> FunctionTool | None:
         return self._tools_by_safe_name.get(safe_name)
 
     async def execute(
@@ -261,7 +261,11 @@ class MessagesToolBundle:
 
         arguments = tool_use.get("input") or {}
         proxy = self._executors[name]
-        result = await proxy.execute(context=context, name=name, arguments=arguments)
+        result = await proxy.execute(
+            context=context,
+            name=name,
+            input=JsonContent(json=arguments),
+        )
         return result
 
 
@@ -543,12 +547,12 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
         middleware: list[BaseTool] = []
 
         for toolkit in toolkits:
-            executable_tools: list[Tool] = []
+            executable_tools: list[FunctionTool] = []
 
             for t in toolkit.tools:
                 if isinstance(t, MCPConnectorTool):
                     middleware.append(t)
-                elif isinstance(t, Tool):
+                elif isinstance(t, FunctionTool):
                     executable_tools.append(t)
                 elif isinstance(t, BaseTool):
                     if hasattr(t, "apply") and callable(getattr(t, "apply")):
