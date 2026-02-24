@@ -5,7 +5,7 @@ import pytest
 
 from meshagent.anthropic.messages_adapter import AnthropicMessagesAdapter
 from meshagent.anthropic.mcp import MCPConfig, MCPServer, MCPTool
-from meshagent.agents.agent import AgentChatContext
+from meshagent.agents.agent import AgentSessionContext
 from meshagent.tools import Toolkit
 
 
@@ -54,7 +54,7 @@ async def test_live_anthropic_adapter_messages_create_if_key_set():
     client = a.AsyncAnthropic(api_key=api_key)
     adapter = AnthropicMessagesAdapter(model=model, client=client, max_tokens=64)
 
-    ctx = AgentChatContext(system_role=None)
+    ctx = AgentSessionContext(system_role=None)
     ctx.append_user_message("Say hello in one word.")
 
     text = await adapter.next(context=ctx, room=_DummyRoom(), toolkits=[])
@@ -74,7 +74,7 @@ async def test_live_anthropic_adapter_streaming_if_key_set():
     client = a.AsyncAnthropic(api_key=api_key)
     adapter = AnthropicMessagesAdapter(model=model, client=client, max_tokens=64)
 
-    ctx = AgentChatContext(system_role=None)
+    ctx = AgentSessionContext(system_role=None)
     ctx.append_user_message("Count from 1 to 3.")
 
     seen_types: list[str] = []
@@ -107,7 +107,7 @@ async def test_live_anthropic_mcp_deepwiki_if_key_set():
     client = a.AsyncAnthropic(api_key=api_key)
     adapter = AnthropicMessagesAdapter(model=model, client=client, max_tokens=256)
 
-    ctx = AgentChatContext(system_role=None)
+    ctx = AgentSessionContext(system_role=None)
     ctx.append_user_message(
         "Use the DeepWiki MCP toolset and make at least one tool call. "
         "Then reply with a one-sentence summary of what you learned."

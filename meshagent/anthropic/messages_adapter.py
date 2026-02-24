@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from meshagent.agents.agent import AgentChatContext
+from meshagent.agents.agent import AgentSessionContext
 from meshagent.api import RoomClient, RoomException, RemoteParticipant
 from meshagent.tools import Toolkit, ToolContext, FunctionTool, BaseTool
 from meshagent.api.messaging import (
@@ -96,7 +96,7 @@ async def _consume_streaming_tool_result(
     return ensure_content(last_item)
 
 
-class AnthropicMessagesChatContext(AgentChatContext):
+class AnthropicMessagesChatContext(AgentSessionContext):
     @property
     def supports_images(self) -> bool:
         return True
@@ -292,7 +292,7 @@ class AnthropicMessagesToolResponseAdapter(ToolResponseAdapter):
     async def create_messages(
         self,
         *,
-        context: AgentChatContext,
+        context: AgentSessionContext,
         tool_call: Any,
         room: RoomClient,
         response: Content,
@@ -413,7 +413,7 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
     def default_model(self) -> str:
         return self._model
 
-    def create_chat_context(self) -> AgentChatContext:
+    def create_session(self) -> AgentSessionContext:
         return AnthropicMessagesChatContext(system_role=None)
 
     def get_anthropic_client(self, *, room: RoomClient) -> Any:
@@ -423,7 +423,7 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
         return get_client(room=room, http_client=http_client)
 
     def _convert_messages(
-        self, *, context: AgentChatContext
+        self, *, context: AgentSessionContext
     ) -> tuple[list[dict], Optional[str]]:
         system = context.get_system_instructions()
 
@@ -593,10 +593,9 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
     async def next(
         self,
         *,
-        context: AgentChatContext,
+        context: AgentSessionContext,
         room: RoomClient,
         toolkits: list[Toolkit],
-        tool_adapter: Optional[ToolResponseAdapter] = None,
         output_schema: Optional[dict] = None,
         event_handler: Optional[Callable[[dict], None]] = None,
         model: Optional[str] = None,
@@ -605,8 +604,7 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
         if model is None:
             model = self.default_model()
 
-        if tool_adapter is None:
-            tool_adapter = AnthropicMessagesToolResponseAdapter()
+        tool_adapter = AnthropicMessagesToolResponseAdapter()
 
         client = self.get_anthropic_client(room=room)
 

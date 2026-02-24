@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from meshagent.api import RoomClient, RemoteParticipant
-from meshagent.agents.agent import AgentChatContext
+from meshagent.agents.agent import AgentSessionContext
 from meshagent.tools import Toolkit
 
 from .messages_adapter import AnthropicMessagesAdapter
@@ -386,10 +386,9 @@ class AnthropicOpenAIResponsesStreamAdapter(AnthropicMessagesAdapter):
     async def next(
         self,
         *,
-        context: AgentChatContext,
+        context: AgentSessionContext,
         room: RoomClient,
         toolkits: list[Toolkit],
-        tool_adapter: Any = None,
         output_schema: Optional[dict] = None,
         event_handler: Optional[Callable[[dict], None]] = None,
         model: Optional[str] = None,
@@ -400,7 +399,6 @@ class AnthropicOpenAIResponsesStreamAdapter(AnthropicMessagesAdapter):
             context=context,
             room=room,
             toolkits=toolkits,
-            tool_adapter=tool_adapter,
             output_schema=output_schema,
             event_handler=event_handler,
             model=model,

@@ -4,11 +4,10 @@ from meshagent.anthropic.messages_adapter import (
     AnthropicMessagesAdapter,
     _consume_streaming_tool_result,
 )
-from meshagent.agents.agent import AgentChatContext
+from meshagent.agents.agent import AgentSessionContext
 from meshagent.api.messaging import JsonContent, TextContent
 from meshagent.tools import FunctionTool, Toolkit
 from meshagent.api import RoomException
-from meshagent.agents.adapter import ToolResponseAdapter
 
 
 class _DummyParticipant:
@@ -24,6 +23,10 @@ class _DummyParticipant:
 class _DummyRoom:
     def __init__(self):
         self.local_participant = _DummyParticipant()
+        self.developer = self
+
+    def log_nowait(self, **kwargs):
+        del kwargs
 
 
 class _AnyArgsTool(FunctionTool):
@@ -36,52 +39,6 @@ class _AnyArgsTool(FunctionTool):
 
     async def execute(self, context, **kwargs):
         return {"ok": True, "args": kwargs}
-
-
-class _ToolResultAdapter(ToolResponseAdapter):
-    async def to_plain_text(self, *, room, response):
-        return "ok"
-
-    async def create_messages(self, *, context, tool_call, room, response):
-        return [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": tool_call["id"],
-                        "content": [{"type": "text", "text": "ok"}],
-                    }
-                ],
-            }
-        ]
-
-
-class _CaptureToolResultAdapter(ToolResponseAdapter):
-    def __init__(self):
-        self.responses: list[object] = []
-
-    async def to_plain_text(self, *, room, response):
-        del room
-        self.responses.append(response)
-        return "ok"
-
-    async def create_messages(self, *, context, tool_call, room, response):
-        del context
-        del room
-        self.responses.append(response)
-        return [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": tool_call["id"],
-                        "content": [{"type": "text", "text": "ok"}],
-                    }
-                ],
-            }
-        ]
 
 
 class _FakeAdapter(AnthropicMessagesAdapter):
@@ -118,7 +75,7 @@ class _StreamingTool(FunctionTool):
 
 
 def test_convert_messages_drops_assistant_between_tool_use_and_tool_result():
-    ctx = AgentChatContext(
+    ctx = AgentSessionContext(
         system_role=None,
         messages=[
             {"role": "user", "content": "hi"},
@@ -156,7 +113,7 @@ def test_convert_messages_drops_assistant_between_tool_use_and_tool_result():
 
 
 def test_convert_messages_raises_if_tool_result_not_immediately_next():
-    ctx = AgentChatContext(
+    ctx = AgentSessionContext(
         system_role=None,
         messages=[
             {"role": "user", "content": "hi"},
@@ -195,7 +152,7 @@ async def test_next_batches_multiple_tool_results_into_single_user_message():
     ]
 
     adapter = _FakeAdapter(responses=responses)
-    ctx = AgentChatContext(system_role=None)
+    ctx = AgentSessionContext(system_role=None)
     ctx.append_user_message("run tools")
 
     toolkit = Toolkit(
@@ -207,7 +164,6 @@ async def test_next_batches_multiple_tool_results_into_single_user_message():
         context=ctx,
         room=_DummyRoom(),
         toolkits=[toolkit],
-        tool_adapter=_ToolResultAdapter(),
     )
 
     assert result == "done"
@@ -242,29 +198,31 @@ async def test_next_uses_final_stream_item_as_tool_result() -> None:
     ]
 
     adapter = _FakeAdapter(responses=responses)
-    ctx = AgentChatContext(system_role=None)
+    ctx = AgentSessionContext(system_role=None)
     ctx.append_user_message("run tool")
 
     toolkit = Toolkit(name="test", tools=[_StreamingTool("tool_a")])
-    capture_tool_adapter = _CaptureToolResultAdapter()
-
     result = await adapter.next(
         context=ctx,
         room=_DummyRoom(),
         toolkits=[toolkit],
-        tool_adapter=capture_tool_adapter,
     )
 
     assert result == "done"
-    assert len(capture_tool_adapter.responses) == 1
-    response = capture_tool_adapter.responses[0]
-    assert isinstance(response, TextContent)
-    assert response.text == "tool-final"
+    assert [m["role"] for m in ctx.messages] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+    ]
+    tool_result_content = ctx.messages[2]["content"][0]["content"][0]
+    assert tool_result_content["type"] == "text"
+    assert tool_result_content["text"] == "tool-final"
 
 
 def test_create_chat_context_supports_images_and_files() -> None:
     adapter = AnthropicMessagesAdapter(client=object())
-    context = adapter.create_chat_context()
+    context = adapter.create_session()
 
     assert context.supports_images is True
     assert context.supports_files is True
