@@ -4,6 +4,8 @@ from pydantic import BaseModel
 from meshagent.anthropic.openai_responses_stream_adapter import (
     AnthropicOpenAIResponsesStreamAdapter,
 )
+from meshagent.anthropic.messages_adapter import AnthropicMessagesAdapter
+from meshagent.agents.agent import AgentSessionContext
 
 
 class _Event(BaseModel):
@@ -68,7 +70,10 @@ async def test_openai_responses_stream_emits_content_part_events():
         _Event(type="message_stop"),
     ]
 
-    stream = _FakeStream(events=events, final=_FinalMessage())
+    stream = _FakeStream(
+        events=events,
+        final=_FinalMessage(usage={"input_tokens": 3, "output_tokens": 5}),
+    )
     client = _FakeClient(stream)
 
     adapter = AnthropicOpenAIResponsesStreamAdapter(client=client)
@@ -100,3 +105,45 @@ async def test_openai_responses_stream_emits_content_part_events():
     assert completed["response"]["usage"]["input_tokens"] == 3
     assert completed["response"]["usage"]["output_tokens"] == 5
     assert completed["response"]["usage"]["total_tokens"] == 8
+
+
+@pytest.mark.asyncio
+async def test_openai_responses_stream_next_forwards_options(monkeypatch):
+    called: dict = {}
+
+    async def _fake_next(
+        self,
+        *,
+        context,
+        room,
+        toolkits,
+        output_schema=None,
+        event_handler=None,
+        model=None,
+        on_behalf_of=None,
+        options=None,
+    ):
+        del self
+        del context
+        del room
+        del toolkits
+        del output_schema
+        del event_handler
+        del model
+        del on_behalf_of
+        called["options"] = options
+        return "ok"
+
+    monkeypatch.setattr(AnthropicMessagesAdapter, "next", _fake_next)
+
+    adapter = AnthropicOpenAIResponsesStreamAdapter(client=object())
+
+    result = await adapter.next(
+        context=AgentSessionContext(system_role=None),
+        room=object(),
+        toolkits=[],
+        options={"reasoning": {"effort": "none"}},
+    )
+
+    assert result == "ok"
+    assert called["options"] == {"reasoning": {"effort": "none"}}

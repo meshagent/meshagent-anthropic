@@ -393,6 +393,7 @@ class AnthropicOpenAIResponsesStreamAdapter(AnthropicMessagesAdapter):
         event_handler: Optional[Callable[[dict], None]] = None,
         model: Optional[str] = None,
         on_behalf_of: Optional[RemoteParticipant] = None,
+        options: Optional[dict] = None,
     ) -> Any:
         # Keep the same behavior; only streaming shape changes.
         return await super().next(
@@ -403,4 +404,5 @@ class AnthropicOpenAIResponsesStreamAdapter(AnthropicMessagesAdapter):
             event_handler=event_handler,
             model=model,
             on_behalf_of=on_behalf_of,
+            options=options,
         )

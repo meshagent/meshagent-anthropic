@@ -760,7 +760,10 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
         event_handler: Optional[Callable[[dict], None]] = None,
         model: Optional[str] = None,
         on_behalf_of: Optional[RemoteParticipant] = None,
+        options: Optional[dict] = None,
     ) -> Any:
+        del options
+
         if model is None:
             model = self.default_model()
 

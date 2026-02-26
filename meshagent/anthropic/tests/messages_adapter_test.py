@@ -396,6 +396,27 @@ async def test_next_stores_usage_metadata() -> None:
     assert context.metadata["last_response_usage"]["output_tokens"] == 5
 
 
+@pytest.mark.asyncio
+async def test_next_accepts_options_keyword_argument() -> None:
+    adapter = _FakeAdapter(
+        responses=[{"content": [{"type": "text", "text": "ok"}]}],
+    )
+    context = AgentSessionContext(system_role=None)
+    context.append_user_message("hello")
+
+    result = await adapter.next(
+        context=context,
+        room=_DummyRoom(),
+        toolkits=[],
+        options={"reasoning": {"effort": "none"}},
+    )
+
+    assert result == "ok"
+    assert len(adapter.requests) == 1
+    request = adapter.requests[0]
+    assert "reasoning" not in request
+
+
 class _ToolItemStream:
     def __init__(self, *, items: list[object]):
         self._items = items
