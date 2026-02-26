@@ -42,14 +42,16 @@ class _AnyArgsTool(FunctionTool):
 
 
 class _FakeAdapter(AnthropicMessagesAdapter):
-    def __init__(self, responses: list[dict]):
-        super().__init__(client=object())
+    def __init__(self, responses: list[dict], **kwargs):
+        super().__init__(client=object(), **kwargs)
         self._responses = responses
         self._idx = 0
+        self.requests: list[dict] = []
 
     async def _create_with_optional_headers(self, *, client, request):
         if self._idx >= len(self._responses):
             raise AssertionError("unexpected extra request")
+        self.requests.append(request)
         resp = self._responses[self._idx]
         self._idx += 1
         return resp
@@ -236,6 +238,162 @@ def test_create_chat_context_supports_images_and_files() -> None:
         data=b"%PDF-1.7",
     )
     assert file_message["content"][0]["type"] == "document"
+
+
+def test_constructor_rejects_invalid_context_management_mode() -> None:
+    with pytest.raises(
+        ValueError, match="context_management must be one of 'auto' or 'none'"
+    ):
+        AnthropicMessagesAdapter(client=object(), context_management="invalid")
+
+
+def test_constructor_rejects_invalid_compaction_threshold() -> None:
+    with pytest.raises(
+        ValueError,
+        match="compaction_threshold must be greater than or equal to 50000",
+    ):
+        AnthropicMessagesAdapter(client=object(), compaction_threshold=49999)
+
+
+@pytest.mark.asyncio
+async def test_next_adds_auto_compaction_request_fields() -> None:
+    adapter = _FakeAdapter(
+        responses=[{"content": [{"type": "text", "text": "ok"}]}],
+        model="claude-sonnet-4-6",
+        context_management="auto",
+        compaction_threshold=50001,
+    )
+    context = AgentSessionContext(system_role=None)
+    context.append_user_message("hello")
+
+    result = await adapter.next(
+        context=context,
+        room=_DummyRoom(),
+        toolkits=[],
+    )
+
+    assert result == "ok"
+    assert len(adapter.requests) == 1
+    request = adapter.requests[0]
+    assert request["context_management"] == {
+        "edits": [
+            {
+                "type": "compact_20260112",
+                "trigger": {"type": "input_tokens", "value": 50001},
+                "pause_after_compaction": False,
+            }
+        ]
+    }
+    assert "compact-2026-01-12" in request["betas"]
+
+
+@pytest.mark.asyncio
+async def test_next_preserves_existing_betas_when_adding_compaction_beta() -> None:
+    adapter = _FakeAdapter(
+        responses=[{"content": [{"type": "text", "text": "ok"}]}],
+        model="claude-opus-4-6",
+        context_management="auto",
+        message_options={"betas": ["mcp-client-2025-11-20"]},
+    )
+    context = AgentSessionContext(system_role=None)
+    context.append_user_message("hello")
+
+    result = await adapter.next(
+        context=context,
+        room=_DummyRoom(),
+        toolkits=[],
+    )
+
+    assert result == "ok"
+    assert len(adapter.requests) == 1
+    request = adapter.requests[0]
+    assert "mcp-client-2025-11-20" in request["betas"]
+    assert "compact-2026-01-12" in request["betas"]
+
+
+@pytest.mark.asyncio
+async def test_next_skips_auto_compaction_for_legacy_model_versions() -> None:
+    adapter = _FakeAdapter(
+        responses=[{"content": [{"type": "text", "text": "ok"}]}],
+        model="claude-sonnet-4-5",
+        context_management="auto",
+    )
+    context = AgentSessionContext(system_role=None)
+    context.append_user_message("hello")
+
+    result = await adapter.next(
+        context=context,
+        room=_DummyRoom(),
+        toolkits=[],
+    )
+
+    assert result == "ok"
+    assert len(adapter.requests) == 1
+    request = adapter.requests[0]
+    assert "context_management" not in request
+    assert "betas" not in request
+
+
+@pytest.mark.asyncio
+async def test_next_uses_context_management_beta_for_non_compaction_edits() -> None:
+    adapter = _FakeAdapter(
+        responses=[{"content": [{"type": "text", "text": "ok"}]}],
+        message_options={
+            "context_management": {
+                "edits": [{"type": "clear_tool_uses_20250919", "trigger": "auto"}]
+            }
+        },
+    )
+    context = AgentSessionContext(system_role=None)
+    context.append_user_message("hello")
+
+    result = await adapter.next(
+        context=context,
+        room=_DummyRoom(),
+        toolkits=[],
+    )
+
+    assert result == "ok"
+    assert len(adapter.requests) == 1
+    request = adapter.requests[0]
+    assert "context-management-2025-06-27" in request["betas"]
+
+
+@pytest.mark.asyncio
+async def test_next_stores_usage_metadata() -> None:
+    adapter = _FakeAdapter(
+        responses=[
+            {
+                "content": [{"type": "text", "text": "ok"}],
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 5,
+                    "iterations": [
+                        {
+                            "type": "compaction",
+                            "input_tokens": 10,
+                            "output_tokens": 5,
+                            "cache_creation_input_tokens": 0,
+                            "cache_read_input_tokens": 0,
+                        }
+                    ],
+                },
+            }
+        ]
+    )
+    context = AgentSessionContext(system_role=None)
+    context.append_user_message("hello")
+
+    result = await adapter.next(
+        context=context,
+        room=_DummyRoom(),
+        toolkits=[],
+    )
+
+    assert result == "ok"
+    assert context.metadata["last_response_model"] == adapter.default_model()
+    assert context.metadata["last_response_usage"]["input_tokens"] == 10
+    assert context.metadata["last_response_usage"]["output_tokens"] == 5
 
 
 class _ToolItemStream:

@@ -12,6 +12,16 @@ from meshagent.anthropic import AnthropicMessagesAdapter
 adapter = AnthropicMessagesAdapter(model="claude-3-5-sonnet-latest")
 ```
 
+Compaction can be enabled through Anthropic context management:
+
+```Python Python
+adapter = AnthropicMessagesAdapter(
+    model="claude-sonnet-4-5",
+    context_management="auto",
+    compaction_threshold=150000,
+)
+```
+
 ### Tool Response Adapter
 `AnthropicMessagesToolResponseAdapter` converts a tool's structured response into Anthropic `tool_result` blocks that can be inserted back into the conversation.
 

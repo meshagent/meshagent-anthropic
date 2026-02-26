@@ -16,7 +16,7 @@ from meshagent.api.messaging import (
 from meshagent.agents.adapter import ToolResponseAdapter, LLMAdapter
 
 import json
-from typing import Any, Optional, Callable
+from typing import Any, Optional, Callable, Literal
 from collections.abc import AsyncIterable
 import os
 import logging
@@ -27,6 +27,7 @@ from html_to_markdown import convert
 
 from meshagent.anthropic.proxy import get_client, get_logging_httpx_client
 from meshagent.anthropic.mcp import MCPTool as MCPConnectorTool
+from pydantic import BaseModel
 
 try:
     from anthropic import APIStatusError
@@ -34,6 +35,9 @@ except Exception:  # pragma: no cover
     APIStatusError = Exception  # type: ignore
 
 logger = logging.getLogger("anthropic_agent")
+
+_CONTEXT_MANAGEMENT_BETA = "context-management-2025-06-27"
+_COMPACTION_BETA = "compact-2026-01-12"
 
 
 def _is_html_mime_type(mime_type: str | None) -> bool:
@@ -402,13 +406,27 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
         message_options: Optional[dict] = None,
         provider: str = "anthropic",
         log_requests: bool = False,
+        context_management: Literal["auto", "none"] = "none",
+        compaction_threshold: int = 150000,
+        compaction_pause_after: bool = False,
+        compaction_instructions: Optional[str] = None,
     ):
+        if context_management not in ("auto", "none"):
+            raise ValueError("context_management must be one of 'auto' or 'none'")
+        if compaction_threshold < 50000:
+            raise ValueError(
+                "compaction_threshold must be greater than or equal to 50000"
+            )
         self._model = model
         self._max_tokens = max_tokens
         self._client = client
         self._message_options = message_options or {}
         self._provider = provider
         self._log_requests = log_requests
+        self._context_management_mode = context_management
+        self._compaction_threshold = compaction_threshold
+        self._compaction_pause_after = compaction_pause_after
+        self._compaction_instructions = compaction_instructions
 
     def default_model(self) -> str:
         return self._model
@@ -505,6 +523,148 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
             request = dict(request)
             request.pop("extra_headers", None)
             return await api.create(**request)
+
+    def _ensure_beta(self, *, request: dict[str, Any], beta: str) -> None:
+        betas = request.get("betas")
+        if betas is None:
+            request["betas"] = [beta]
+            return
+        if isinstance(betas, str):
+            normalized_betas = [betas]
+        else:
+            normalized_betas = [*betas]
+        if beta not in normalized_betas:
+            normalized_betas.append(beta)
+        request["betas"] = normalized_betas
+
+    def _ensure_context_management_betas(self, *, request: dict[str, Any]) -> None:
+        context_management = request.get("context_management")
+        if context_management is None:
+            return
+        if not isinstance(context_management, dict):
+            self._ensure_beta(request=request, beta=_CONTEXT_MANAGEMENT_BETA)
+            return
+        edits = context_management.get("edits")
+        if edits is None:
+            self._ensure_beta(request=request, beta=_CONTEXT_MANAGEMENT_BETA)
+            return
+
+        has_compaction_edit = False
+        for edit in edits:
+            if isinstance(edit, dict) and edit.get("type") == "compact_20260112":
+                has_compaction_edit = True
+                break
+
+        if has_compaction_edit:
+            self._ensure_beta(request=request, beta=_COMPACTION_BETA)
+            return
+        self._ensure_beta(request=request, beta=_CONTEXT_MANAGEMENT_BETA)
+
+    def _build_compaction_edit(self) -> dict[str, Any]:
+        edit: dict[str, Any] = {
+            "type": "compact_20260112",
+            "trigger": {"type": "input_tokens", "value": self._compaction_threshold},
+            "pause_after_compaction": self._compaction_pause_after,
+        }
+        if self._compaction_instructions is not None:
+            edit["instructions"] = self._compaction_instructions
+        return edit
+
+    @staticmethod
+    def _supports_auto_compaction_model(*, model: str) -> bool:
+        normalized_model = model.strip().lower()
+        if normalized_model == "":
+            return False
+
+        direct_match = re.match(r"^claude-(sonnet|opus)-(.+)$", normalized_model)
+        if direct_match is not None:
+            version_parts = direct_match.group(2).split("-")
+            if len(version_parts) == 0 or not version_parts[0].isdigit():
+                return False
+
+            major = int(version_parts[0])
+            minor = 0
+            if (
+                len(version_parts) > 1
+                and version_parts[1].isdigit()
+                and len(version_parts[1]) <= 2
+            ):
+                minor = int(version_parts[1])
+            return (major, minor) > (4, 5)
+
+        legacy_match = re.match(
+            r"^claude-(\d+)-(\d+)-(sonnet|opus)(?:-|$)",
+            normalized_model,
+        )
+        if legacy_match is not None:
+            major = int(legacy_match.group(1))
+            minor = int(legacy_match.group(2))
+            return (major, minor) > (4, 5)
+
+        return False
+
+    def _add_auto_compaction_context_management(
+        self, *, request: dict[str, Any]
+    ) -> None:
+        if self._context_management_mode != "auto":
+            return
+        model = request.get("model")
+        if not isinstance(model, str) or not self._supports_auto_compaction_model(
+            model=model
+        ):
+            return
+
+        compaction_edit = self._build_compaction_edit()
+        context_management = request.get("context_management")
+
+        if context_management is None:
+            request["context_management"] = {"edits": [compaction_edit]}
+            return
+        if not isinstance(context_management, dict):
+            raise ValueError("context_management must be an object")
+
+        edits_value = context_management.get("edits")
+        if edits_value is None:
+            edits: list[Any] = []
+        else:
+            edits = [*edits_value]
+
+        has_compaction_edit = False
+        normalized_edits = list[Any]()
+        for edit in edits:
+            if isinstance(edit, dict) and edit.get("type") == "compact_20260112":
+                has_compaction_edit = True
+            normalized_edits.append(edit)
+        if not has_compaction_edit:
+            normalized_edits.append(compaction_edit)
+
+        request["context_management"] = {
+            **context_management,
+            "edits": normalized_edits,
+        }
+
+    def _normalize_usage(self, usage: object) -> dict[str, Any] | None:
+        if usage is None:
+            return None
+        if isinstance(usage, dict):
+            return usage
+        if isinstance(usage, BaseModel):
+            try:
+                return usage.model_dump(mode="json")
+            except Exception:
+                return None
+        return None
+
+    def _store_usage(
+        self, *, context: AgentSessionContext, response: dict[str, Any], model: str
+    ) -> None:
+        usage = self._normalize_usage(response.get("usage"))
+        if usage is not None:
+            context.metadata["last_response_usage"] = usage
+            context.metadata["last_response_model"] = model
+        context_management = response.get("context_management")
+        if isinstance(context_management, dict):
+            context.metadata["last_context_management"] = context_management
 
     async def _stream_message(
         self,
@@ -651,6 +811,8 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
                     request=request,
                     middleware=middleware,
                 )
+                self._add_auto_compaction_context_management(request=request)
+                self._ensure_context_management_betas(request=request)
 
                 # Normalize empty lists to None for Anthropic.
                 if (
@@ -687,6 +849,8 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
                         request=request,
                     )
                     response_dict = _as_jsonable(response)
+
+                self._store_usage(context=context, response=response_dict, model=model)
 
                 content_blocks = []
                 raw_content = response_dict.get("content")

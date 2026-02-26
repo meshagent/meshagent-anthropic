@@ -154,3 +154,47 @@ async def test_live_anthropic_mcp_deepwiki_if_key_set():
     # This asserts the connector actually engaged (best-effort, but should be stable
     # for DeepWiki).
     assert seen_mcp_blocks
+
+
+@pytest.mark.asyncio
+async def test_live_anthropic_adapter_compaction_if_key_set():
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        pytest.skip("ANTHROPIC_API_KEY not set")
+
+    model = os.getenv(
+        "ANTHROPIC_COMPACTION_TEST_MODEL",
+        os.getenv("ANTHROPIC_TEST_MODEL", "claude-sonnet-4-6"),
+    )
+
+    client = a.AsyncAnthropic(api_key=api_key)
+    adapter = AnthropicMessagesAdapter(
+        model=model,
+        client=client,
+        max_tokens=64,
+        context_management="auto",
+        compaction_threshold=50000,
+    )
+
+    ctx = AgentSessionContext(system_role=None)
+    ctx.append_user_message(
+        "Reply with the single word 'ready'. Then wait for the next message."
+    )
+
+    try:
+        first = await adapter.next(context=ctx, room=_DummyRoom(), toolkits=[])
+    except Exception as ex:
+        message = str(ex)
+        if "does not support the 'compact_20260112'" in message:
+            pytest.skip(f"model {model} does not support compact_20260112")
+        raise
+    assert isinstance(first, str)
+
+    ctx.append_user_message("Now reply with the single word 'done'.")
+    second = await adapter.next(context=ctx, room=_DummyRoom(), toolkits=[])
+    assert isinstance(second, str)
+    assert len(second.strip()) > 0
+    assert ctx.metadata.get("last_response_model") == model
+    usage = ctx.metadata.get("last_response_usage")
+    assert isinstance(usage, dict)
+    assert int(usage.get("input_tokens", 0)) > 0
