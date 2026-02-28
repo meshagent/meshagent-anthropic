@@ -12,9 +12,9 @@ keywords = []
 dependencies = [
   "pytest~=8.4",
   "pytest-asyncio~=0.26",
-  "meshagent-api~=0.28.11",
-  "meshagent-agents~=0.28.11",
-  "meshagent-tools~=0.28.11",
+  "meshagent-api~=0.28.12",
+  "meshagent-agents~=0.28.12",
+  "meshagent-tools~=0.28.12",
   "anthropic~=0.78.0",
   "html-to-markdown~=2.24.3",
 ]
