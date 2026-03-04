@@ -391,9 +391,52 @@ async def test_next_stores_usage_metadata() -> None:
     )
 
     assert result == "ok"
+    assert context.turn_count == 1
     assert context.metadata["last_response_model"] == adapter.default_model()
     assert context.metadata["last_response_usage"]["input_tokens"] == 10
     assert context.metadata["last_response_usage"]["output_tokens"] == 5
+    assert context.usage == {
+        "input_tokens": 10.0,
+        "output_tokens": 5.0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_next_stores_usage_for_streaming_response(monkeypatch) -> None:
+    adapter = _FakeAdapter(responses=[])
+    context = AgentSessionContext(system_role=None)
+    context.append_user_message("hello")
+    events: list[dict] = []
+
+    async def _fake_stream_message(*, client, request, event_handler):
+        del client
+        del request
+        event_handler({"type": "message.delta"})
+        return {
+            "content": [{"type": "text", "text": "ok"}],
+            "usage": {
+                "input_tokens": 7,
+                "output_tokens": 4,
+            },
+        }
+
+    monkeypatch.setattr(adapter, "_stream_message", _fake_stream_message)
+
+    result = await adapter.next(
+        context=context,
+        room=_DummyRoom(),
+        toolkits=[],
+        event_handler=events.append,
+    )
+
+    assert result == "ok"
+    assert events[0]["type"] == "message.delta"
+    assert context.turn_count == 1
+    assert context.metadata["last_response_usage"]["input_tokens"] == 7
+    assert context.usage == {
+        "input_tokens": 7.0,
+        "output_tokens": 4.0,
+    }
 
 
 @pytest.mark.asyncio

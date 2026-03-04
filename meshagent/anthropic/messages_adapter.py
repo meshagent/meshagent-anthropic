@@ -27,7 +27,11 @@ from html_to_markdown import convert
 
 from meshagent.anthropic.proxy import get_client, get_logging_httpx_client
 from meshagent.anthropic.mcp import MCPTool as MCPConnectorTool
-from pydantic import BaseModel
+from meshagent.anthropic.usage import (
+    add_usage_metrics,
+    normalize_anthropic_usage,
+    preprocess_anthropic_usage,
+)
 
 try:
     from anthropic import APIStatusError
@@ -643,25 +647,17 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
             "edits": normalized_edits,
         }
 
-    def _normalize_usage(self, usage: object) -> dict[str, Any] | None:
-        if usage is None:
-            return None
-        if isinstance(usage, dict):
-            return usage
-        if isinstance(usage, BaseModel):
-            try:
-                return usage.model_dump(mode="json")
-            except Exception:
-                return None
-        return None
-
     def _store_usage(
         self, *, context: AgentSessionContext, response: dict[str, Any], model: str
     ) -> None:
-        usage = self._normalize_usage(response.get("usage"))
+        usage = normalize_anthropic_usage(response.get("usage"))
         if usage is not None:
             context.metadata["last_response_usage"] = usage
             context.metadata["last_response_model"] = model
+
+            flattened_usage = preprocess_anthropic_usage(model=model, usage=usage)
+            if flattened_usage is not None:
+                add_usage_metrics(totals=context.usage, usage=flattened_usage)
         context_management = response.get("context_management")
         if isinstance(context_management, dict):
             context.metadata["last_context_management"] = context_management
@@ -766,6 +762,8 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
 
         if model is None:
             model = self.default_model()
+
+        context.turn_count += 1
 
         tool_adapter = AnthropicMessagesToolResponseAdapter()
 
