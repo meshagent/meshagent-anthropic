@@ -2,6 +2,11 @@ from __future__ import annotations
 
 from meshagent.agents.agent import AgentSessionContext
 from meshagent.api import RoomClient, RoomException, RemoteParticipant
+from meshagent.agents.event_publisher import (
+    _AnthropicAgentEventPublisher,
+    make_anthropic_agent_event_publisher,
+)
+from meshagent.agents.messages import AgentMessage
 from meshagent.tools import Toolkit, ToolContext, FunctionTool, BaseTool
 from meshagent.api.messaging import (
     Content,
@@ -23,7 +28,9 @@ import logging
 import re
 import asyncio
 import base64
+import mimetypes
 from html_to_markdown import convert
+from urllib.parse import urlparse
 
 from meshagent.anthropic.proxy import get_client, get_logging_httpx_client
 from meshagent.anthropic.mcp import MCPTool as MCPConnectorTool
@@ -32,16 +39,210 @@ from meshagent.anthropic.usage import (
     normalize_anthropic_usage,
     preprocess_anthropic_usage,
 )
+from meshagent.tools.strict_schema import ensure_strict_json_schema
 
 try:
-    from anthropic import APIStatusError
+    from anthropic import APIStatusError, transform_schema
 except Exception:  # pragma: no cover
     APIStatusError = Exception  # type: ignore
+    transform_schema = None  # type: ignore
 
 logger = logging.getLogger("anthropic_agent")
 
 _CONTEXT_MANAGEMENT_BETA = "context-management-2025-06-27"
 _COMPACTION_BETA = "compact-2026-01-12"
+ToolCallingMode = Literal["loose", "strict", "explicit", "adaptive"]
+_LEGACY_ANTHROPIC_MAX_TOKENS = 8192
+_MAX_PAUSE_TURN_CONTINUATIONS = 5
+
+
+class _AnthropicToolCallingState:
+    def __init__(self, *, mode: ToolCallingMode):
+        self.mode = mode
+        self._adaptive_strict_tools: set[str] = set()
+        self._adaptive_strict_disabled = False
+
+    def strict_for_tool(self, *, tool_name: str, tool: FunctionTool) -> bool:
+        if self.mode == "loose":
+            return False
+        if self.mode == "strict":
+            return True
+        if self.mode == "explicit":
+            return tool.strict
+        if self._adaptive_strict_disabled:
+            return False
+        return tool.strict and tool_name in self._adaptive_strict_tools
+
+    def record_tool_failure(self, *, tool_name: str, tool: FunctionTool) -> None:
+        if self.mode != "adaptive":
+            return
+        if self._adaptive_strict_disabled:
+            return
+        if not tool.strict:
+            return
+        self._adaptive_strict_tools.add(tool_name)
+
+    def disable_all_strict(self) -> None:
+        if self.mode != "adaptive":
+            return
+        self._adaptive_strict_tools.clear()
+        self._adaptive_strict_disabled = True
+
+
+def _transform_strict_anthropic_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    normalized_schema = _normalize_anthropic_union_types(schema)
+    if transform_schema is None:
+        return normalized_schema
+    return transform_schema(normalized_schema)
+
+
+def _default_max_tokens_for_model(model: str) -> int:
+    normalized_model = model.strip().lower()
+    if normalized_model.startswith("claude-opus-4-6"):
+        return 128_000
+    if normalized_model.startswith("claude-sonnet-4"):
+        return 64_000
+    if normalized_model.startswith("claude-3-7-sonnet"):
+        return 64_000
+    if normalized_model.startswith("claude-opus-4"):
+        return 32_000
+    return _LEGACY_ANTHROPIC_MAX_TOKENS
+
+
+def _normalize_anthropic_union_types(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_normalize_anthropic_union_types(item) for item in value]
+
+    if not isinstance(value, dict):
+        return value
+
+    normalized = {
+        key: _normalize_anthropic_union_types(item) for key, item in value.items()
+    }
+    normalized = _lower_nullable_object_properties(normalized)
+    type_value = normalized.get("type")
+    if not isinstance(type_value, list):
+        return _strip_empty_object_compound_wrapper(normalized)
+
+    normalized_types = [item for item in type_value if isinstance(item, str)]
+    if len(normalized_types) == 0:
+        return normalized
+    if len(normalized_types) == 1:
+        normalized["type"] = normalized_types[0]
+        return normalized
+
+    base_variant = {key: item for key, item in normalized.items() if key != "type"}
+    any_of: list[dict[str, Any]] = []
+    for item_type in normalized_types:
+        if item_type == "null":
+            any_of.append({"type": "null"})
+            continue
+
+        variant = dict(base_variant)
+        variant["type"] = item_type
+        any_of.append(variant)
+
+    normalized = {"anyOf": any_of}
+    return _strip_empty_object_compound_wrapper(normalized)
+
+
+def _lower_nullable_object_properties(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return value
+    if value.get("type") != "object":
+        return value
+
+    properties = value.get("properties")
+    if not isinstance(properties, dict):
+        return value
+
+    required_value = value.get("required")
+    required = (
+        [item for item in required_value if isinstance(item, str)]
+        if isinstance(required_value, list)
+        else None
+    )
+
+    updated_properties = dict[str, Any]()
+    updated_required = None if required is None else [*required]
+    changed = False
+
+    for key, property_schema in properties.items():
+        lowered_schema = _extract_optional_property_schema(property_schema)
+        if lowered_schema is None:
+            updated_properties[key] = property_schema
+            continue
+
+        changed = True
+        updated_properties[key] = lowered_schema
+        if updated_required is not None and key in updated_required:
+            updated_required.remove(key)
+
+    if not changed:
+        return value
+
+    normalized = dict(value)
+    normalized["properties"] = updated_properties
+    if updated_required is not None:
+        if len(updated_required) == 0:
+            normalized.pop("required", None)
+        else:
+            normalized["required"] = updated_required
+    return normalized
+
+
+def _extract_optional_property_schema(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+
+    any_of = value.get("anyOf")
+    if not isinstance(any_of, list) or len(any_of) != 2:
+        return None
+
+    non_null_variants = list[dict[str, Any]]()
+    has_null_variant = False
+    for variant in any_of:
+        if not isinstance(variant, dict):
+            return None
+        if variant.get("type") == "null":
+            has_null_variant = True
+            continue
+        non_null_variants.append(variant)
+
+    if not has_null_variant or len(non_null_variants) != 1:
+        return None
+
+    return non_null_variants[0]
+
+
+def _strip_empty_object_compound_wrapper(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return value
+
+    has_compound = any(
+        isinstance(value.get(key), list) for key in ("anyOf", "oneOf", "allOf")
+    )
+    if not has_compound:
+        return value
+
+    properties = value.get("properties")
+    required = value.get("required")
+    additional_properties = value.get("additionalProperties")
+    if value.get("type") != "object":
+        return value
+    if properties not in (None, {}):
+        return value
+    if required not in (None, []):
+        return value
+    if additional_properties not in (None, False):
+        return value
+
+    stripped = dict(value)
+    stripped.pop("type", None)
+    stripped.pop("properties", None)
+    stripped.pop("required", None)
+    stripped.pop("additionalProperties", None)
+    return stripped
 
 
 def _is_html_mime_type(mime_type: str | None) -> bool:
@@ -147,6 +348,22 @@ class AnthropicMessagesChatContext(AgentSessionContext):
         self.messages.append(message)
         return message
 
+    def append_image_url(self, *, url: str) -> dict:
+        message = {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "url",
+                        "url": url,
+                    },
+                }
+            ],
+        }
+        self.messages.append(message)
+        return message
+
     def append_file_message(
         self, *, filename: str, mime_type: str, data: bytes
     ) -> dict:
@@ -208,12 +425,56 @@ class AnthropicMessagesChatContext(AgentSessionContext):
         self.messages.append(message)
         return message
 
+    def append_file_url(self, *, url: str) -> dict:
+        parsed_url = urlparse(url)
+        guessed_mime_type, _ = mimetypes.guess_type(parsed_url.path)
+        normalized_mime_type = (guessed_mime_type or "application/octet-stream").lower()
+
+        if normalized_mime_type.startswith("image/"):
+            return self.append_image_url(url=url)
+
+        if normalized_mime_type == "application/pdf":
+            title = os.path.basename(parsed_url.path) or "attachment.pdf"
+            message = {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "document",
+                        "title": title,
+                        "source": {
+                            "type": "url",
+                            "url": url,
+                        },
+                    }
+                ],
+            }
+            self.messages.append(message)
+            return message
+
+        message = {
+            "role": "user",
+            "content": [_text_block(f"the user attached a file available at {url}")],
+        }
+        self.messages.append(message)
+        return message
+
 
 class MessagesToolBundle:
-    def __init__(self, toolkits: list[Toolkit]):
+    def __init__(
+        self,
+        toolkits: list[Toolkit],
+        *,
+        tool_calling_state: _AnthropicToolCallingState | None = None,
+    ):
         self._executors: dict[str, Toolkit] = {}
         self._safe_names: dict[str, str] = {}
         self._tools_by_safe_name: dict[str, FunctionTool] = {}
+        self._effective_strict_by_safe_name: dict[str, bool] = {}
+        self._tool_calling_state = (
+            tool_calling_state
+            if tool_calling_state is not None
+            else _AnthropicToolCallingState(mode="explicit")
+        )
 
         tools: list[dict] = []
 
@@ -237,12 +498,20 @@ class MessagesToolBundle:
                 schema = {**v.input_schema}
                 if v.defs is not None:
                     schema["$defs"] = v.defs
+                effective_strict = self._tool_calling_state.strict_for_tool(
+                    tool_name=original_name,
+                    tool=v,
+                )
+                self._effective_strict_by_safe_name[safe_name] = effective_strict
+                if effective_strict:
+                    schema = _transform_strict_anthropic_schema(schema)
 
                 tools.append(
                     {
                         "name": safe_name,
                         "description": v.description,
                         "input_schema": schema,
+                        "strict": effective_strict,
                     }
                 )
 
@@ -251,8 +520,48 @@ class MessagesToolBundle:
     def to_json(self) -> list[dict] | None:
         return None if self._tools is None else self._tools.copy()
 
+    def uses_strict_tools(self) -> bool:
+        return any(self._effective_strict_by_safe_name.values())
+
     def get_tool(self, safe_name: str) -> FunctionTool | None:
         return self._tools_by_safe_name.get(safe_name)
+
+    def resolve_function_tool_name(self, safe_name: str) -> tuple[str, str] | None:
+        original_name = self._safe_names.get(safe_name)
+        if original_name is None:
+            return None
+
+        toolkit = self._executors.get(original_name)
+        if toolkit is None:
+            return None
+
+        return toolkit.name, original_name
+
+    def record_tool_failure(self, *, tool_use: dict) -> None:
+        safe_name = tool_use.get("name")
+        if not isinstance(safe_name, str):
+            return
+        original_name = self._safe_names.get(safe_name)
+        if original_name is None:
+            return
+        tool = self._tools_by_safe_name.get(safe_name)
+        if tool is None:
+            return
+        self._tool_calling_state.record_tool_failure(
+            tool_name=original_name,
+            tool=tool,
+        )
+
+    def disable_all_strict(self) -> None:
+        self._tool_calling_state.disable_all_strict()
+
+    def validation_mode_for_tool_use(self, *, tool_use: dict) -> str | None:
+        safe_name = tool_use.get("name")
+        if not isinstance(safe_name, str):
+            return None
+        if self._effective_strict_by_safe_name.get(safe_name) is True:
+            return "content_types"
+        return None
 
     async def execute(
         self, *, context: ToolContext, tool_use: dict
@@ -405,7 +714,7 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
     def __init__(
         self,
         model: str = os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-latest"),
-        max_tokens: int = int(os.getenv("ANTHROPIC_MAX_TOKENS", "8192")),
+        max_tokens: int | None = None,
         client: Optional[Any] = None,
         message_options: Optional[dict] = None,
         provider: str = "anthropic",
@@ -414,15 +723,25 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
         compaction_threshold: int = 150000,
         compaction_pause_after: bool = False,
         compaction_instructions: Optional[str] = None,
+        tool_calling_mode: ToolCallingMode = "adaptive",
     ):
         if context_management not in ("auto", "none"):
             raise ValueError("context_management must be one of 'auto' or 'none'")
+        if tool_calling_mode not in ("loose", "strict", "explicit", "adaptive"):
+            raise ValueError(
+                "tool_calling_mode must be one of 'loose', 'strict', 'explicit', or 'adaptive'"
+            )
         if compaction_threshold < 50000:
             raise ValueError(
                 "compaction_threshold must be greater than or equal to 50000"
             )
         self._model = model
-        self._max_tokens = max_tokens
+        env_max_tokens = os.getenv("ANTHROPIC_MAX_TOKENS")
+        self._max_tokens = (
+            int(env_max_tokens)
+            if env_max_tokens is not None and env_max_tokens != ""
+            else max_tokens
+        )
         self._client = client
         self._message_options = message_options or {}
         self._provider = provider
@@ -431,12 +750,51 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
         self._compaction_threshold = compaction_threshold
         self._compaction_pause_after = compaction_pause_after
         self._compaction_instructions = compaction_instructions
+        self._tool_calling_state = _AnthropicToolCallingState(mode=tool_calling_mode)
 
     def default_model(self) -> str:
         return self._model
 
+    def _resolved_max_tokens(self, *, model: str) -> int:
+        if self._max_tokens is not None:
+            return self._max_tokens
+        return _default_max_tokens_for_model(model)
+
+    def _stop_reason_error_message(self, *, stop_reason: str) -> str | None:
+        if stop_reason == "max_tokens":
+            return (
+                "Anthropic response hit max_tokens before completing the turn. "
+                "Increase max_tokens and retry."
+            )
+        if stop_reason == "model_context_window_exceeded":
+            return "Anthropic response hit the model context window before completing the turn."
+        if stop_reason == "refusal":
+            return "Anthropic refused to respond."
+        return None
+
     def create_session(self) -> AgentSessionContext:
         return AnthropicMessagesChatContext(system_role=None)
+
+    def make_agent_event_publisher(
+        self,
+        turn_id: str,
+        thread_id: str,
+        callback: Callable[[AgentMessage], None],
+    ) -> Callable[[dict[str, Any]], None]:
+        return make_anthropic_agent_event_publisher(
+            turn_id=turn_id,
+            thread_id=thread_id,
+            callback=callback,
+        )
+
+    def _set_function_tool_name_resolver(
+        self,
+        *,
+        event_handler: Callable[[dict[str, Any]], None] | None,
+        resolver: Callable[[str], tuple[str, str] | None] | None,
+    ) -> None:
+        if isinstance(event_handler, _AnthropicAgentEventPublisher):
+            event_handler.set_function_tool_name_resolver(resolver)
 
     def get_anthropic_client(self, *, room: RoomClient) -> Any:
         if self._client is not None:
@@ -647,6 +1005,13 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
             "edits": normalized_edits,
         }
 
+    def _is_tool_schema_grammar_complexity_error(self, *, error: Exception) -> bool:
+        message = str(error).lower()
+        return (
+            "compiled grammar is too large" in message
+            or "reduce the number of strict tools" in message
+        )
+
     def _store_usage(
         self, *, context: AgentSessionContext, response: dict[str, Any], model: str
     ) -> None:
@@ -770,13 +1135,21 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
         client = self.get_anthropic_client(room=room)
 
         validation_attempts = 0
+        pause_turn_continuations = 0
 
         try:
             while True:
                 executable_toolkits, middleware = self._split_toolkits(
                     toolkits=toolkits
                 )
-                tool_bundle = MessagesToolBundle(toolkits=executable_toolkits)
+                tool_bundle = MessagesToolBundle(
+                    toolkits=executable_toolkits,
+                    tool_calling_state=self._tool_calling_state,
+                )
+                self._set_function_tool_name_resolver(
+                    event_handler=event_handler,
+                    resolver=tool_bundle.resolve_function_tool_name,
+                )
 
                 messages, system = self._convert_messages(context=context)
 
@@ -795,7 +1168,7 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
 
                 request = {
                     "model": model,
-                    "max_tokens": self._max_tokens,
+                    "max_tokens": self._resolved_max_tokens(model=model),
                     "messages": messages,
                     "system": system,
                     "tools": tools_list,
@@ -805,7 +1178,12 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
 
                 if output_schema is not None:
                     request["output_config"] = {
-                        "format": {"type": "json_schema", "schema": output_schema}
+                        "format": {
+                            "type": "json_schema",
+                            "schema": _transform_strict_anthropic_schema(
+                                ensure_strict_json_schema(output_schema)
+                            ),
+                        }
                     }
 
                 request = self._apply_request_middleware(
@@ -837,19 +1215,32 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
 
                 logger.info("requesting response from anthropic with model: %s", model)
 
-                if event_handler is not None:
-                    final_message = await self._stream_message(
-                        client=client,
-                        request=request,
-                        event_handler=event_handler,
-                    )
-                    response_dict = _as_jsonable(final_message)
-                else:
-                    response = await self._create_with_optional_headers(
-                        client=client,
-                        request=request,
-                    )
-                    response_dict = _as_jsonable(response)
+                try:
+                    if event_handler is not None:
+                        final_message = await self._stream_message(
+                            client=client,
+                            request=request,
+                            event_handler=event_handler,
+                        )
+                        response_dict = _as_jsonable(final_message)
+                    else:
+                        response = await self._create_with_optional_headers(
+                            client=client,
+                            request=request,
+                        )
+                        response_dict = _as_jsonable(response)
+                except APIStatusError as e:
+                    if (
+                        self._tool_calling_state.mode == "adaptive"
+                        and tool_bundle.uses_strict_tools()
+                        and self._is_tool_schema_grammar_complexity_error(error=e)
+                    ):
+                        logger.warning(
+                            "anthropic strict tool grammar is too large; disabling strict tool calling and retrying"
+                        )
+                        tool_bundle.disable_all_strict()
+                        continue
+                    raise
 
                 self._store_usage(context=context, response=response_dict, model=model)
 
@@ -859,10 +1250,36 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
                     content_blocks = raw_content
 
                 tool_uses = [b for b in content_blocks if b.get("type") == "tool_use"]
+                stop_reason = response_dict.get("stop_reason")
+                if stop_reason == "max_tokens" and len(tool_uses) > 0:
+                    if event_handler is not None:
+                        for tool_use in tool_uses:
+                            event_handler(
+                                {
+                                    "type": "meshagent.handler.done",
+                                    "item_id": tool_use.get("id"),
+                                    "error": (
+                                        "Anthropic response hit max_tokens before completing tool calls. "
+                                        "Increase max_tokens and retry."
+                                    ),
+                                }
+                            )
+                    raise RoomException(
+                        "Anthropic response hit max_tokens before completing tool calls. "
+                        "Increase max_tokens and retry."
+                    )
 
                 # Keep the assistant message in context.
                 assistant_message = {"role": "assistant", "content": content_blocks}
                 context.messages.append(assistant_message)
+
+                if stop_reason == "pause_turn":
+                    pause_turn_continuations += 1
+                    if pause_turn_continuations > _MAX_PAUSE_TURN_CONTINUATIONS:
+                        raise RoomException(
+                            "Anthropic response paused too many times while processing server tools."
+                        )
+                    continue
 
                 if tool_uses:
                     tasks = []
@@ -873,8 +1290,26 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
                             caller=room.local_participant,
                             on_behalf_of=on_behalf_of,
                             caller_context={"chat": context.to_json()},
+                            validation_mode=tool_bundle.validation_mode_for_tool_use(
+                                tool_use=tool_use
+                            ),
                         )
                         try:
+                            if event_handler is not None:
+                                event_handler(
+                                    {
+                                        "type": "meshagent.handler.added",
+                                        "item": {
+                                            "type": "function_call",
+                                            "id": tool_use.get("id"),
+                                            "call_id": tool_use.get("id"),
+                                            "name": tool_use.get("name"),
+                                            "arguments": json.dumps(
+                                                tool_use.get("input") or {}
+                                            ),
+                                        },
+                                    }
+                                )
                             tool_response = await tool_bundle.execute(
                                 context=tool_context,
                                 tool_use=tool_use,
@@ -886,6 +1321,19 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
                                 )
                             else:
                                 tool_response = ensure_content(tool_response)
+                            if event_handler is not None:
+                                handler_result = None
+                                if isinstance(tool_response, JsonContent):
+                                    handler_result = tool_response.json
+                                elif isinstance(tool_response, TextContent):
+                                    handler_result = tool_response.text
+                                event_handler(
+                                    {
+                                        "type": "meshagent.handler.done",
+                                        "item_id": tool_use.get("id"),
+                                        "result": handler_result,
+                                    }
+                                )
                             return await tool_adapter.create_messages(
                                 context=context,
                                 tool_call=tool_use,
@@ -893,10 +1341,19 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
                                 response=tool_response,
                             )
                         except Exception as ex:
+                            tool_bundle.record_tool_failure(tool_use=tool_use)
                             logger.error(
                                 f"error in tool call {json.dumps(tool_use)}:",
                                 exc_info=ex,
                             )
+                            if event_handler is not None:
+                                event_handler(
+                                    {
+                                        "type": "meshagent.handler.done",
+                                        "item_id": tool_use.get("id"),
+                                        "error": f"{ex}",
+                                    }
+                                )
                             tool_result_content = [_text_block(f"Error: {ex}")]
                             message = {
                                 "role": "user",
@@ -955,6 +1412,14 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
                     ]
                 )
 
+                stop_reason_error = (
+                    self._stop_reason_error_message(stop_reason=stop_reason)
+                    if isinstance(stop_reason, str)
+                    else None
+                )
+                if stop_reason_error is not None:
+                    raise RoomException(stop_reason_error)
+
                 if output_schema is None:
                     return text
 
@@ -980,3 +1445,8 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
 
         except APIStatusError as e:
             raise RoomException(f"Error from Anthropic: {e}")
+        finally:
+            self._set_function_tool_name_resolver(
+                event_handler=event_handler,
+                resolver=None,
+            )

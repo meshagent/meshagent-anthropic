@@ -112,7 +112,9 @@ class AnthropicOpenAIResponsesStreamAdapter(AnthropicMessagesAdapter):
             "usage": None,
         }
 
-        async with client.messages.stream(**request) as stream:
+        api = self._messages_api(client=client, request=request)
+
+        async with api.stream(**request) as stream:
             async for event in stream:
                 data = event.model_dump(
                     mode="json",
@@ -154,6 +156,7 @@ class AnthropicOpenAIResponsesStreamAdapter(AnthropicMessagesAdapter):
                     elif btype == "tool_use":
                         call_id = str(block.get("id"))
                         name = str(block.get("name"))
+                        item_id = call_id
                         item = output_function_call_item(
                             item_id=item_id,
                             call_id=call_id,

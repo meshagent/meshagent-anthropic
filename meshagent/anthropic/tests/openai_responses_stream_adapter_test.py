@@ -46,14 +46,30 @@ class _FakeStream:
 class _FakeMessages:
     def __init__(self, stream: _FakeStream):
         self._stream = stream
+        self.calls: list[dict] = []
 
     def stream(self, **kwargs):
+        self.calls.append(kwargs)
         return self._stream
 
 
 class _FakeClient:
-    def __init__(self, stream: _FakeStream):
-        self.messages = _FakeMessages(stream)
+    def __init__(
+        self,
+        *,
+        messages_stream: _FakeStream,
+        beta_stream: _FakeStream | None = None,
+    ):
+        self.messages = _FakeMessages(messages_stream)
+        self.beta = type(
+            "_FakeBeta",
+            (),
+            {
+                "messages": _FakeMessages(
+                    messages_stream if beta_stream is None else beta_stream
+                )
+            },
+        )()
 
 
 @pytest.mark.asyncio
@@ -74,7 +90,7 @@ async def test_openai_responses_stream_emits_content_part_events():
         events=events,
         final=_FinalMessage(usage={"input_tokens": 3, "output_tokens": 5}),
     )
-    client = _FakeClient(stream)
+    client = _FakeClient(messages_stream=stream)
 
     adapter = AnthropicOpenAIResponsesStreamAdapter(client=client)
 
@@ -105,6 +121,88 @@ async def test_openai_responses_stream_emits_content_part_events():
     assert completed["response"]["usage"]["input_tokens"] == 3
     assert completed["response"]["usage"]["output_tokens"] == 5
     assert completed["response"]["usage"]["total_tokens"] == 8
+
+
+@pytest.mark.asyncio
+async def test_openai_responses_stream_uses_tool_use_id_for_function_call_items():
+    events = [
+        _Event(type="message_start", message={"id": "msg_1", "model": "claude"}),
+        _Event(
+            type="content_block_start",
+            index=0,
+            content_block={
+                "type": "tool_use",
+                "id": "toolu_123",
+                "name": "read_file",
+            },
+        ),
+        _Event(
+            type="content_block_delta",
+            index=0,
+            delta={"type": "input_json_delta", "partial_json": '{"path":"src/app.py"}'},
+        ),
+        _Event(type="content_block_stop", index=0),
+        _Event(type="message_stop"),
+    ]
+
+    stream = _FakeStream(
+        events=events,
+        final=_FinalMessage(usage={"input_tokens": 3, "output_tokens": 5}),
+    )
+    client = _FakeClient(messages_stream=stream)
+    adapter = AnthropicOpenAIResponsesStreamAdapter(client=client)
+
+    emitted: list[dict] = []
+
+    await adapter._stream_message(
+        client=client,
+        request={"model": "x", "max_tokens": 5, "messages": []},
+        event_handler=emitted.append,
+    )
+
+    added = next(e for e in emitted if e["type"] == "response.output_item.added")
+    done = next(e for e in emitted if e["type"] == "response.output_item.done")
+    args_done = next(
+        e for e in emitted if e["type"] == "response.function_call_arguments.done"
+    )
+
+    assert added["item"]["id"] == "toolu_123"
+    assert added["item"]["call_id"] == "toolu_123"
+    assert done["item"]["id"] == "toolu_123"
+    assert done["item"]["call_id"] == "toolu_123"
+    assert args_done["item_id"] == "toolu_123"
+
+
+@pytest.mark.asyncio
+async def test_openai_responses_stream_uses_beta_messages_api_when_betas_present():
+    messages_stream = _FakeStream(events=[], final=_FinalMessage())
+    beta_stream = _FakeStream(
+        events=[
+            _Event(type="message_start", message={"id": "msg_1", "model": "claude"}),
+            _Event(type="message_stop"),
+        ],
+        final=_FinalMessage(),
+    )
+    client = _FakeClient(messages_stream=messages_stream, beta_stream=beta_stream)
+    adapter = AnthropicOpenAIResponsesStreamAdapter(client=client)
+
+    emitted: list[dict] = []
+
+    await adapter._stream_message(
+        client=client,
+        request={
+            "model": "x",
+            "max_tokens": 5,
+            "messages": [],
+            "betas": ["context-management-2025-06-27"],
+        },
+        event_handler=emitted.append,
+    )
+
+    assert client.messages.calls == []
+    assert len(client.beta.messages.calls) == 1
+    assert client.beta.messages.calls[0]["betas"] == ["context-management-2025-06-27"]
+    assert any(event["type"] == "response.completed" for event in emitted)
 
 
 @pytest.mark.asyncio

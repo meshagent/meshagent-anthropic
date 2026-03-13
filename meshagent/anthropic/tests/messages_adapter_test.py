@@ -1,12 +1,34 @@
 import pytest
+from typing import Any
 
+from meshagent.agents.messages import (
+    AgentFileContentDelta,
+    AgentFileContentEnded,
+    AgentFileContentStarted,
+    AgentReasoningContentDelta,
+    AgentReasoningContentEnded,
+    AgentReasoningContentStarted,
+    AgentTextContentDelta,
+    AgentTextContentEnded,
+    AgentTextContentStarted,
+    AgentToolCallEnded,
+    AgentToolCallStarted,
+)
+from meshagent.agents.event_publisher import (
+    _AgentMessageEmitter,
+    _AnthropicAgentEventPublisher,
+)
 from meshagent.anthropic.messages_adapter import (
     AnthropicMessagesAdapter,
+    MessagesToolBundle,
+    _AnthropicToolCallingState,
+    _default_max_tokens_for_model,
     _consume_streaming_tool_result,
+    safe_tool_name,
 )
 from meshagent.agents.agent import AgentSessionContext
 from meshagent.api.messaging import JsonContent, TextContent
-from meshagent.tools import FunctionTool, Toolkit
+from meshagent.tools import FunctionTool, Toolkit, ToolContext
 from meshagent.api import RoomException
 
 
@@ -38,6 +60,139 @@ class _AnyArgsTool(FunctionTool):
         )
 
     async def execute(self, context, **kwargs):
+        return {"ok": True, "args": kwargs}
+
+
+class _StrictOptOutTool(FunctionTool):
+    def __init__(self, name: str):
+        super().__init__(
+            name=name,
+            input_schema={"type": "object", "properties": {}, "required": []},
+            description="test tool",
+            strict=False,
+        )
+
+    async def execute(self, context, **kwargs):
+        del context
+        del kwargs
+        return {"ok": True}
+
+
+class _NumericBoundsTool(FunctionTool):
+    def __init__(self, name: str):
+        super().__init__(
+            name=name,
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "count": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 5,
+                    }
+                },
+                "required": ["count"],
+                "additionalProperties": False,
+            },
+            description="numeric bounds test tool",
+        )
+
+    async def execute(self, context, **kwargs):
+        del context
+        return {"ok": True, "args": kwargs}
+
+
+class _BoundedExecutionTool(FunctionTool):
+    def __init__(self, name: str):
+        super().__init__(
+            name=name,
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "count": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 5,
+                    }
+                },
+                "required": ["count"],
+                "additionalProperties": False,
+            },
+            description="bounded execution tool",
+        )
+
+    async def execute(self, context: ToolContext, count: int) -> dict[str, Any]:
+        del context
+        return {"count": count}
+
+
+class _NullableStringTool(FunctionTool):
+    def __init__(self, name: str):
+        super().__init__(
+            name=name,
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "value": {
+                        "type": ["string", "null"],
+                    }
+                },
+                "required": ["value"],
+                "additionalProperties": False,
+            },
+            description="nullable string test tool",
+        )
+
+    async def execute(self, context, **kwargs):
+        del context
+        return {"ok": True, "args": kwargs}
+
+
+class _WrappedAnyOfObjectTool(FunctionTool):
+    def __init__(self, name: str):
+        super().__init__(
+            name=name,
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "tools": {
+                        "anyOf": [
+                            {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "anyOf": [
+                                        {
+                                            "type": "object",
+                                            "properties": {
+                                                "a": {"type": "string"},
+                                            },
+                                            "required": ["a"],
+                                            "additionalProperties": False,
+                                        },
+                                        {
+                                            "type": "object",
+                                            "properties": {
+                                                "b": {"type": "integer"},
+                                            },
+                                            "required": ["b"],
+                                            "additionalProperties": False,
+                                        },
+                                    ],
+                                },
+                            },
+                            {"type": "null"},
+                        ]
+                    }
+                },
+                "required": ["tools"],
+                "additionalProperties": False,
+            },
+            description="wrapped anyOf tool",
+        )
+
+    async def execute(self, context, **kwargs):
+        del context
         return {"ok": True, "args": kwargs}
 
 
@@ -74,6 +229,43 @@ class _StreamingTool(FunctionTool):
             yield TextContent(text="tool-final")
 
         return _run()
+
+
+class _FailingTool(FunctionTool):
+    def __init__(self, name: str, *, strict: bool = True):
+        super().__init__(
+            name=name,
+            input_schema={"type": "object", "additionalProperties": True},
+            description="failing test tool",
+            strict=strict,
+        )
+
+    async def execute(self, context, **kwargs):
+        del context
+        del kwargs
+        raise RoomException("tool failed")
+
+
+class _WriteFileLikeTool(FunctionTool):
+    def __init__(self) -> None:
+        super().__init__(
+            name="write_file",
+            input_schema={
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["path", "text", "overwrite"],
+                "properties": {
+                    "path": {"type": "string"},
+                    "text": {"type": "string"},
+                    "overwrite": {"type": "boolean"},
+                },
+            },
+            description="write a file",
+        )
+
+    async def execute(self, context, **kwargs):
+        del context
+        return {"ok": True, "args": kwargs}
 
 
 def test_convert_messages_drops_assistant_between_tool_use_and_tool_result():
@@ -222,6 +414,821 @@ async def test_next_uses_final_stream_item_as_tool_result() -> None:
     assert tool_result_content["text"] == "tool-final"
 
 
+def test_messages_tool_bundle_marks_function_tools_strict_by_default() -> None:
+    toolkit = Toolkit(name="test", tools=[_AnyArgsTool("tool_a")])
+
+    tool_bundle = MessagesToolBundle(toolkits=[toolkit])
+
+    assert tool_bundle.to_json() == [
+        {
+            "name": "tool_a",
+            "description": "test tool",
+            "input_schema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+            "strict": True,
+        }
+    ]
+
+
+def test_messages_tool_bundle_allows_tools_to_opt_out_of_strict_mode() -> None:
+    toolkit = Toolkit(name="test", tools=[_StrictOptOutTool("tool_a")])
+
+    tool_bundle = MessagesToolBundle(toolkits=[toolkit])
+
+    assert tool_bundle.to_json() == [
+        {
+            "name": "tool_a",
+            "description": "test tool",
+            "input_schema": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+            "strict": False,
+        }
+    ]
+
+
+def test_messages_tool_bundle_transforms_unsupported_numeric_constraints() -> None:
+    toolkit = Toolkit(name="test", tools=[_NumericBoundsTool("tool_a")])
+
+    tool_bundle = MessagesToolBundle(toolkits=[toolkit])
+
+    assert tool_bundle.to_json() == [
+        {
+            "name": "tool_a",
+            "description": "numeric bounds test tool",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "count": {
+                        "type": "integer",
+                        "description": "{minimum: 1, maximum: 5}",
+                    }
+                },
+                "required": ["count"],
+                "additionalProperties": False,
+            },
+            "strict": True,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_messages_tool_bundle_execute_respects_context_validation_mode():
+    toolkit = Toolkit(name="test", tools=[_BoundedExecutionTool("tool_a")])
+    tool_bundle = MessagesToolBundle(toolkits=[toolkit])
+
+    result = await tool_bundle.execute(
+        context=ToolContext(
+            room=_DummyRoom(),
+            caller=_DummyParticipant(),
+            validation_mode="content_types",
+        ),
+        tool_use={"name": "tool_a", "id": "toolu_1", "input": {"count": 9}},
+    )
+
+    assert isinstance(result, JsonContent)
+    assert result.json == {"count": 9}
+
+
+def test_messages_tool_bundle_uses_content_types_validation_for_strict_tools() -> None:
+    toolkit = Toolkit(name="test", tools=[_NumericBoundsTool("tool_a")])
+    tool_bundle = MessagesToolBundle(toolkits=[toolkit])
+
+    assert (
+        tool_bundle.validation_mode_for_tool_use(
+            tool_use={"name": "tool_a", "id": "toolu_1", "input": {}}
+        )
+        == "content_types"
+    )
+
+
+def test_messages_tool_bundle_normalizes_nullable_union_types() -> None:
+    toolkit = Toolkit(name="test", tools=[_NullableStringTool("tool_a")])
+
+    tool_bundle = MessagesToolBundle(toolkits=[toolkit])
+
+    assert tool_bundle.to_json() == [
+        {
+            "name": "tool_a",
+            "description": "nullable string test tool",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "value": {
+                        "type": "string",
+                    }
+                },
+                "additionalProperties": False,
+            },
+            "strict": True,
+        }
+    ]
+
+
+def test_messages_tool_bundle_strips_empty_object_wrapper_around_anyof() -> None:
+    toolkit = Toolkit(name="test", tools=[_WrappedAnyOfObjectTool("tool_a")])
+
+    tool_bundle = MessagesToolBundle(toolkits=[toolkit])
+
+    assert tool_bundle.to_json() == [
+        {
+            "name": "tool_a",
+            "description": "wrapped anyOf tool",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "tools": {
+                        "type": "array",
+                        "items": {
+                            "anyOf": [
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "a": {"type": "string"},
+                                    },
+                                    "additionalProperties": False,
+                                    "required": ["a"],
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "b": {"type": "integer"},
+                                    },
+                                    "additionalProperties": False,
+                                    "required": ["b"],
+                                },
+                            ]
+                        },
+                    }
+                },
+                "additionalProperties": False,
+            },
+            "strict": True,
+        }
+    ]
+
+
+def test_messages_tool_bundle_loose_mode_disables_strict_tools() -> None:
+    toolkit = Toolkit(name="test", tools=[_AnyArgsTool("tool_a")])
+    state = _AnthropicToolCallingState(mode="loose")
+
+    tool_bundle = MessagesToolBundle(
+        toolkits=[toolkit],
+        tool_calling_state=state,
+    )
+
+    assert tool_bundle.to_json() == [
+        {
+            "name": "tool_a",
+            "description": "test tool",
+            "input_schema": {
+                "type": "object",
+                "additionalProperties": True,
+            },
+            "strict": False,
+        }
+    ]
+
+
+def test_messages_tool_bundle_strict_mode_forces_strict_on_non_strict_tools() -> None:
+    toolkit = Toolkit(name="test", tools=[_StrictOptOutTool("tool_a")])
+    state = _AnthropicToolCallingState(mode="strict")
+
+    tool_bundle = MessagesToolBundle(
+        toolkits=[toolkit],
+        tool_calling_state=state,
+    )
+
+    assert tool_bundle.to_json() == [
+        {
+            "name": "tool_a",
+            "description": "test tool",
+            "input_schema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+                "required": [],
+            },
+            "strict": True,
+        }
+    ]
+
+
+def test_messages_tool_bundle_adaptive_mode_enables_strict_after_failure() -> None:
+    tool = _NumericBoundsTool("tool_a")
+    toolkit = Toolkit(name="test", tools=[tool])
+    state = _AnthropicToolCallingState(mode="adaptive")
+
+    initial_bundle = MessagesToolBundle(
+        toolkits=[toolkit],
+        tool_calling_state=state,
+    )
+    assert initial_bundle.to_json() == [
+        {
+            "name": "tool_a",
+            "description": "numeric bounds test tool",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "count": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 5,
+                    }
+                },
+                "required": ["count"],
+                "additionalProperties": False,
+            },
+            "strict": False,
+        }
+    ]
+
+    initial_bundle.record_tool_failure(
+        tool_use={"name": "tool_a", "id": "toolu_1", "input": {}}
+    )
+
+    retried_bundle = MessagesToolBundle(
+        toolkits=[toolkit],
+        tool_calling_state=state,
+    )
+    assert retried_bundle.to_json() == [
+        {
+            "name": "tool_a",
+            "description": "numeric bounds test tool",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "count": {
+                        "type": "integer",
+                        "description": "{minimum: 1, maximum: 5}",
+                    }
+                },
+                "required": ["count"],
+                "additionalProperties": False,
+            },
+            "strict": True,
+        }
+    ]
+
+
+def test_messages_tool_bundle_adaptive_mode_does_not_enable_non_strict_tools() -> None:
+    toolkit = Toolkit(name="test", tools=[_FailingTool("tool_a", strict=False)])
+    state = _AnthropicToolCallingState(mode="adaptive")
+
+    initial_bundle = MessagesToolBundle(
+        toolkits=[toolkit],
+        tool_calling_state=state,
+    )
+    initial_bundle.record_tool_failure(
+        tool_use={"name": "tool_a", "id": "toolu_1", "input": {}}
+    )
+
+    retried_bundle = MessagesToolBundle(
+        toolkits=[toolkit],
+        tool_calling_state=state,
+    )
+    assert retried_bundle.to_json() == [
+        {
+            "name": "tool_a",
+            "description": "failing test tool",
+            "input_schema": {
+                "type": "object",
+                "additionalProperties": True,
+            },
+            "strict": False,
+        }
+    ]
+
+
+def test_default_max_tokens_for_model_uses_model_family_defaults() -> None:
+    assert _default_max_tokens_for_model("claude-sonnet-4-6") == 64_000
+    assert _default_max_tokens_for_model("claude-sonnet-4-5") == 64_000
+    assert _default_max_tokens_for_model("claude-3-7-sonnet-latest") == 64_000
+    assert _default_max_tokens_for_model("claude-opus-4-6") == 128_000
+    assert _default_max_tokens_for_model("claude-opus-4-1") == 32_000
+    assert _default_max_tokens_for_model("claude-3-5-sonnet-latest") == 8_192
+
+
+@pytest.mark.asyncio
+async def test_next_uses_model_specific_max_tokens_default() -> None:
+    adapter = _FakeAdapter(
+        responses=[{"content": [{"type": "text", "text": "ok"}]}],
+        model="claude-3-5-sonnet-latest",
+    )
+    context = AgentSessionContext(system_role=None)
+    context.append_user_message("hello")
+
+    result = await adapter.next(
+        context=context,
+        room=_DummyRoom(),
+        toolkits=[],
+        model="claude-sonnet-4-6",
+    )
+
+    assert result == "ok"
+    assert adapter.requests[0]["max_tokens"] == 64_000
+
+
+@pytest.mark.asyncio
+async def test_next_uses_higher_opus_4_6_model_specific_max_tokens_default() -> None:
+    adapter = _FakeAdapter(
+        responses=[{"content": [{"type": "text", "text": "ok"}]}],
+        model="claude-3-5-sonnet-latest",
+    )
+    context = AgentSessionContext(system_role=None)
+    context.append_user_message("hello")
+
+    result = await adapter.next(
+        context=context,
+        room=_DummyRoom(),
+        toolkits=[],
+        model="claude-opus-4-6",
+    )
+
+    assert result == "ok"
+    assert adapter.requests[0]["max_tokens"] == 128_000
+
+
+@pytest.mark.asyncio
+async def test_next_prefers_explicit_max_tokens_over_model_default() -> None:
+    adapter = _FakeAdapter(
+        responses=[{"content": [{"type": "text", "text": "ok"}]}],
+        model="claude-sonnet-4-6",
+        max_tokens=1234,
+    )
+    context = AgentSessionContext(system_role=None)
+    context.append_user_message("hello")
+
+    result = await adapter.next(
+        context=context,
+        room=_DummyRoom(),
+        toolkits=[],
+    )
+
+    assert result == "ok"
+    assert adapter.requests[0]["max_tokens"] == 1234
+
+
+@pytest.mark.asyncio
+async def test_next_prefers_env_max_tokens_over_model_default(monkeypatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_MAX_TOKENS", "4096")
+    adapter = _FakeAdapter(
+        responses=[{"content": [{"type": "text", "text": "ok"}]}],
+        model="claude-sonnet-4-6",
+    )
+    context = AgentSessionContext(system_role=None)
+    context.append_user_message("hello")
+
+    result = await adapter.next(
+        context=context,
+        room=_DummyRoom(),
+        toolkits=[],
+    )
+
+    assert result == "ok"
+    assert adapter.requests[0]["max_tokens"] == 4096
+
+
+@pytest.mark.asyncio
+async def test_next_uses_native_output_config_with_strict_schema() -> None:
+    adapter = _FakeAdapter(
+        responses=[
+            {"content": [{"type": "text", "text": '{"answer":"done"}'}]},
+        ]
+    )
+    ctx = AgentSessionContext(system_role=None)
+    ctx.append_user_message("answer")
+
+    result = await adapter.next(
+        context=ctx,
+        room=_DummyRoom(),
+        toolkits=[],
+        output_schema={
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+        },
+    )
+
+    assert result == {"answer": "done"}
+    assert adapter.requests[0]["output_config"] == {
+        "format": {
+            "type": "json_schema",
+            "schema": {
+                "type": "object",
+                "properties": {"answer": {"type": "string"}},
+                "required": ["answer"],
+                "additionalProperties": False,
+            },
+        }
+    }
+    assert "betas" not in adapter.requests[0]
+
+
+@pytest.mark.asyncio
+async def test_next_transforms_unsupported_numeric_output_constraints() -> None:
+    adapter = _FakeAdapter(
+        responses=[
+            {"content": [{"type": "text", "text": '{"count":3}'}]},
+        ]
+    )
+    ctx = AgentSessionContext(system_role=None)
+    ctx.append_user_message("answer")
+
+    result = await adapter.next(
+        context=ctx,
+        room=_DummyRoom(),
+        toolkits=[],
+        output_schema={
+            "type": "object",
+            "properties": {
+                "count": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 5,
+                }
+            },
+            "required": ["count"],
+            "additionalProperties": False,
+        },
+    )
+
+    assert result == {"count": 3}
+    assert adapter.requests[0]["output_config"] == {
+        "format": {
+            "type": "json_schema",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "count": {
+                        "type": "integer",
+                        "description": "{minimum: 1, maximum: 5}",
+                    }
+                },
+                "required": ["count"],
+                "additionalProperties": False,
+            },
+        }
+    }
+    assert "betas" not in adapter.requests[0]
+
+
+@pytest.mark.asyncio
+async def test_next_normalizes_nullable_union_types_in_output_schema() -> None:
+    adapter = _FakeAdapter(
+        responses=[
+            {"content": [{"type": "text", "text": '{"value":null}'}]},
+        ]
+    )
+    ctx = AgentSessionContext(system_role=None)
+    ctx.append_user_message("answer")
+
+    result = await adapter.next(
+        context=ctx,
+        room=_DummyRoom(),
+        toolkits=[],
+        output_schema={
+            "type": "object",
+            "properties": {
+                "value": {
+                    "type": ["string", "null"],
+                }
+            },
+            "required": ["value"],
+            "additionalProperties": False,
+        },
+    )
+
+    assert result == {"value": None}
+    assert adapter.requests[0]["output_config"] == {
+        "format": {
+            "type": "json_schema",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "value": {
+                        "type": "string",
+                    }
+                },
+                "additionalProperties": False,
+            },
+        }
+    }
+    assert "betas" not in adapter.requests[0]
+
+
+@pytest.mark.asyncio
+async def test_next_adaptive_mode_retries_with_loose_tools_after_grammar_error(
+    monkeypatch,
+) -> None:
+    class _FakeAPIStatusError(Exception):
+        pass
+
+    monkeypatch.setattr(
+        "meshagent.anthropic.messages_adapter.APIStatusError",
+        _FakeAPIStatusError,
+    )
+
+    adapter = AnthropicMessagesAdapter(client=object(), tool_calling_mode="adaptive")
+    tool = _AnyArgsTool("tool_a")
+    adapter._tool_calling_state.record_tool_failure(tool_name="tool_a", tool=tool)
+    ctx = AgentSessionContext(system_role=None)
+    ctx.append_user_message("run tool")
+
+    requests: list[dict] = []
+
+    async def _fake_create_with_optional_headers(*, client, request):
+        del client
+        requests.append(request)
+        if len(requests) == 1:
+            raise _FakeAPIStatusError(
+                "The compiled grammar is too large, which would cause performance issues. "
+                "Simplify your tool schemas or reduce the number of strict tools."
+            )
+        return {"content": [{"type": "text", "text": "done"}]}
+
+    monkeypatch.setattr(
+        adapter,
+        "_create_with_optional_headers",
+        _fake_create_with_optional_headers,
+    )
+
+    result = await adapter.next(
+        context=ctx,
+        room=_DummyRoom(),
+        toolkits=[Toolkit(name="test", tools=[tool])],
+    )
+
+    assert result == "done"
+    assert requests[0]["tools"][0]["strict"] is True
+    assert requests[1]["tools"][0]["strict"] is False
+    assert "betas" not in requests[0]
+    assert "betas" not in requests[1]
+
+
+@pytest.mark.asyncio
+async def test_next_adaptive_mode_enables_strict_after_local_tool_validation_failure(
+    monkeypatch,
+) -> None:
+    tool = _WriteFileLikeTool()
+    adapter = AnthropicMessagesAdapter(client=object(), tool_calling_mode="adaptive")
+    ctx = AgentSessionContext(system_role=None)
+    ctx.append_user_message("write the file")
+
+    requests: list[dict[str, Any]] = []
+    responses = [
+        {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "write_file",
+                    "input": {"path": "/tmp/test.txt"},
+                }
+            ]
+        },
+        {"content": [{"type": "text", "text": "done"}]},
+    ]
+
+    async def _fake_create_with_optional_headers(*, client, request):
+        del client
+        requests.append(request)
+        if len(responses) == 0:
+            raise AssertionError("unexpected extra request")
+        return responses.pop(0)
+
+    monkeypatch.setattr(
+        adapter,
+        "_create_with_optional_headers",
+        _fake_create_with_optional_headers,
+    )
+
+    result = await adapter.next(
+        context=ctx,
+        room=_DummyRoom(),
+        toolkits=[Toolkit(name="storage", tools=[tool])],
+    )
+
+    assert result == "done"
+    assert requests[0]["tools"][0]["name"] == "write_file"
+    assert requests[0]["tools"][0]["strict"] is False
+    assert requests[1]["tools"][0]["name"] == "write_file"
+    assert requests[1]["tools"][0]["strict"] is True
+    assert "betas" not in requests[0]
+    assert "betas" not in requests[1]
+
+
+@pytest.mark.asyncio
+async def test_next_raises_on_truncated_tool_calls_before_appending_assistant_message():
+    adapter = _FakeAdapter(
+        responses=[
+            {
+                "stop_reason": "max_tokens",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "write_file",
+                        "input": {"path": "/tmp/test.txt"},
+                    }
+                ],
+            }
+        ],
+        model="claude-sonnet-4-6",
+    )
+    context = AgentSessionContext(system_role=None)
+    context.append_user_message("write the file")
+
+    with pytest.raises(
+        RoomException,
+        match="Anthropic response hit max_tokens before completing tool calls",
+    ):
+        await adapter.next(
+            context=context,
+            room=_DummyRoom(),
+            toolkits=[Toolkit(name="storage", tools=[_WriteFileLikeTool()])],
+        )
+
+    assert context.messages == [{"role": "user", "content": "write the file"}]
+
+
+@pytest.mark.asyncio
+async def test_next_marks_truncated_streamed_tool_calls_as_failed(
+    monkeypatch,
+) -> None:
+    adapter = AnthropicMessagesAdapter(client=object(), model="claude-sonnet-4-6")
+    context = AgentSessionContext(system_role=None)
+    context.append_user_message("write the file")
+    events: list[dict[str, Any]] = []
+
+    async def _fake_stream_message(*, client, request, event_handler):
+        del client
+        del request
+        event_handler(
+            {
+                "type": "content_block_start",
+                "event": {
+                    "index": 0,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "write_file",
+                        "input": {"path": "/tmp/test.txt"},
+                    },
+                },
+            }
+        )
+        return {
+            "stop_reason": "max_tokens",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "write_file",
+                    "input": {"path": "/tmp/test.txt"},
+                }
+            ],
+        }
+
+    monkeypatch.setattr(adapter, "_stream_message", _fake_stream_message)
+
+    with pytest.raises(
+        RoomException,
+        match="Anthropic response hit max_tokens before completing tool calls",
+    ):
+        await adapter.next(
+            context=context,
+            room=_DummyRoom(),
+            toolkits=[Toolkit(name="storage", tools=[_WriteFileLikeTool()])],
+            event_handler=events.append,
+        )
+
+    assert {
+        "type": "meshagent.handler.done",
+        "item_id": "toolu_1",
+        "error": (
+            "Anthropic response hit max_tokens before completing tool calls. "
+            "Increase max_tokens and retry."
+        ),
+    } in events
+
+
+@pytest.mark.asyncio
+async def test_next_continues_on_pause_turn() -> None:
+    adapter = _FakeAdapter(
+        responses=[
+            {
+                "stop_reason": "pause_turn",
+                "content": [
+                    {
+                        "type": "mcp_tool_use",
+                        "id": "mcpu_1",
+                        "server_name": "web",
+                        "name": "search",
+                        "input": {"query": "anthropic"},
+                    }
+                ],
+            },
+            {
+                "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "done"}],
+            },
+        ],
+        model="claude-sonnet-4-6",
+    )
+    context = AgentSessionContext(system_role=None)
+    context.append_user_message("search")
+
+    result = await adapter.next(
+        context=context,
+        room=_DummyRoom(),
+        toolkits=[],
+    )
+
+    assert result == "done"
+    assert len(adapter.requests) == 2
+    assert context.messages == [
+        {"role": "user", "content": "search"},
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "mcp_tool_use",
+                    "id": "mcpu_1",
+                    "server_name": "web",
+                    "name": "search",
+                    "input": {"query": "anthropic"},
+                }
+            ],
+        },
+        {"role": "assistant", "content": [{"type": "text", "text": "done"}]},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_next_raises_on_truncated_text_response_after_appending_assistant_message():
+    adapter = _FakeAdapter(
+        responses=[
+            {
+                "stop_reason": "max_tokens",
+                "content": [{"type": "text", "text": "partial answer"}],
+            }
+        ],
+        model="claude-sonnet-4-6",
+    )
+    context = AgentSessionContext(system_role=None)
+    context.append_user_message("answer")
+
+    with pytest.raises(
+        RoomException,
+        match="Anthropic response hit max_tokens before completing the turn",
+    ):
+        await adapter.next(
+            context=context,
+            room=_DummyRoom(),
+            toolkits=[],
+        )
+
+    assert context.messages == [
+        {"role": "user", "content": "answer"},
+        {"role": "assistant", "content": [{"type": "text", "text": "partial answer"}]},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_next_raises_on_model_context_window_exceeded_after_appending_assistant_message():
+    adapter = _FakeAdapter(
+        responses=[
+            {
+                "stop_reason": "model_context_window_exceeded",
+                "content": [{"type": "text", "text": "partial answer"}],
+            }
+        ],
+        model="claude-sonnet-4-6",
+    )
+    context = AgentSessionContext(system_role=None)
+    context.append_user_message("answer")
+
+    with pytest.raises(
+        RoomException,
+        match="Anthropic response hit the model context window before completing the turn",
+    ):
+        await adapter.next(
+            context=context,
+            room=_DummyRoom(),
+            toolkits=[],
+        )
+
+    assert context.messages == [
+        {"role": "user", "content": "answer"},
+        {"role": "assistant", "content": [{"type": "text", "text": "partial answer"}]},
+    ]
+
+
 def test_create_chat_context_supports_images_and_files() -> None:
     adapter = AnthropicMessagesAdapter(client=object())
     context = adapter.create_session()
@@ -240,11 +1247,43 @@ def test_create_chat_context_supports_images_and_files() -> None:
     assert file_message["content"][0]["type"] == "document"
 
 
+def test_create_chat_context_supports_remote_image_and_file_urls() -> None:
+    adapter = AnthropicMessagesAdapter(client=object())
+    context = adapter.create_session()
+
+    image_message = context.append_image_url(url="https://example.com/image.png")
+    file_message = context.append_file_url(url="https://example.com/report.pdf")
+
+    assert image_message["content"][0] == {
+        "type": "image",
+        "source": {
+            "type": "url",
+            "url": "https://example.com/image.png",
+        },
+    }
+    assert file_message["content"][0] == {
+        "type": "document",
+        "title": "report.pdf",
+        "source": {
+            "type": "url",
+            "url": "https://example.com/report.pdf",
+        },
+    }
+
+
 def test_constructor_rejects_invalid_context_management_mode() -> None:
     with pytest.raises(
         ValueError, match="context_management must be one of 'auto' or 'none'"
     ):
         AnthropicMessagesAdapter(client=object(), context_management="invalid")
+
+
+def test_constructor_rejects_invalid_tool_calling_mode() -> None:
+    with pytest.raises(
+        ValueError,
+        match="tool_calling_mode must be one of 'loose', 'strict', 'explicit', or 'adaptive'",
+    ):
+        AnthropicMessagesAdapter(client=object(), tool_calling_mode="invalid")
 
 
 def test_constructor_rejects_invalid_compaction_threshold() -> None:
@@ -506,3 +1545,401 @@ async def test_consume_streaming_tool_result_uses_final_item_as_result():
     assert events == [{"progress": 1}]
     assert isinstance(result, JsonContent)
     assert result.json == {"ok": True}
+
+
+def test_make_agent_event_publisher_emits_native_anthropic_messages() -> None:
+    adapter = AnthropicMessagesAdapter(client=object())
+    published = []
+    publisher = adapter.make_agent_event_publisher(
+        turn_id="turn-1",
+        thread_id="thread-1",
+        callback=published.append,
+    )
+
+    publisher({"type": "message_start", "event": {"message": {"id": "msg_1"}}})
+    publisher(
+        {
+            "type": "content_block_start",
+            "event": {"index": 0, "content_block": {"type": "thinking"}},
+        }
+    )
+    publisher(
+        {
+            "type": "content_block_delta",
+            "event": {
+                "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "trace"},
+            },
+        }
+    )
+    publisher({"type": "content_block_stop", "event": {"index": 0}})
+    publisher(
+        {
+            "type": "content_block_start",
+            "event": {"index": 1, "content_block": {"type": "text", "text": ""}},
+        }
+    )
+    publisher(
+        {
+            "type": "content_block_delta",
+            "event": {
+                "index": 1,
+                "delta": {"type": "text_delta", "text": "hello"},
+            },
+        }
+    )
+    publisher({"type": "content_block_stop", "event": {"index": 1}})
+    publisher(
+        {
+            "type": "content_block_start",
+            "event": {
+                "index": 2,
+                "content_block": {
+                    "type": "document",
+                    "source": {
+                        "type": "url",
+                        "url": "https://example.com/report.pdf",
+                    },
+                },
+            },
+        }
+    )
+    publisher({"type": "content_block_stop", "event": {"index": 2}})
+    publisher(
+        {
+            "type": "content_block_start",
+            "event": {
+                "index": 3,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "lookup",
+                    "input": {"q": "meshagent"},
+                },
+            },
+        }
+    )
+    publisher({"type": "content_block_stop", "event": {"index": 3}})
+    publisher(
+        {
+            "type": "meshagent.handler.added",
+            "item": {
+                "type": "function_call",
+                "id": "toolu_1",
+                "call_id": "toolu_1",
+                "name": "lookup",
+                "arguments": '{"q":"meshagent"}',
+            },
+        }
+    )
+    publisher({"type": "meshagent.handler.done", "item_id": "toolu_1"})
+    publisher(
+        {
+            "type": "content_block_start",
+            "event": {
+                "index": 4,
+                "content_block": {
+                    "type": "mcp_tool_use",
+                    "id": "mcpu_1",
+                    "server_name": "deepwiki",
+                    "name": "search",
+                    "input": {"query": "meshagent"},
+                },
+            },
+        }
+    )
+    publisher({"type": "content_block_stop", "event": {"index": 4}})
+    publisher(
+        {
+            "type": "meshagent.handler.added",
+            "item": {
+                "type": "mcp_call",
+                "id": "mcpu_1",
+                "call_id": "mcpu_1",
+                "server_label": "deepwiki",
+                "name": "search",
+                "arguments": {"query": "meshagent"},
+            },
+        }
+    )
+    publisher({"type": "meshagent.handler.done", "item_id": "mcpu_1"})
+
+    assert [type(event) for event in published] == [
+        AgentReasoningContentStarted,
+        AgentReasoningContentDelta,
+        AgentReasoningContentEnded,
+        AgentTextContentStarted,
+        AgentTextContentDelta,
+        AgentTextContentEnded,
+        AgentFileContentStarted,
+        AgentFileContentDelta,
+        AgentFileContentEnded,
+        AgentToolCallStarted,
+        AgentToolCallEnded,
+        AgentToolCallStarted,
+        AgentToolCallEnded,
+    ]
+    for event in published:
+        assert event.thread_id == "thread-1"
+
+    text_delta = published[4]
+    assert isinstance(text_delta, AgentTextContentDelta)
+    assert text_delta.turn_id == "turn-1"
+    assert text_delta.item_id == "msg_1:content:1"
+    assert text_delta.text == "hello"
+
+    file_started = published[6]
+    assert isinstance(file_started, AgentFileContentStarted)
+    assert file_started.item_id == "msg_1:content:2"
+
+    file_delta = published[7]
+    assert isinstance(file_delta, AgentFileContentDelta)
+    assert file_delta.url == "https://example.com/report.pdf"
+
+    function_started = published[9]
+    assert isinstance(function_started, AgentToolCallStarted)
+    assert function_started.toolkit == "function"
+    assert function_started.tool == "lookup"
+    assert function_started.arguments == {"q": "meshagent"}
+
+    mcp_started = published[11]
+    assert isinstance(mcp_started, AgentToolCallStarted)
+    assert mcp_started.toolkit == "deepwiki"
+    assert mcp_started.tool == "search"
+
+
+def test_make_agent_event_publisher_preserves_native_text_delta_whitespace() -> None:
+    adapter = AnthropicMessagesAdapter(client=object())
+    published: list[object] = []
+    publisher = adapter.make_agent_event_publisher(
+        turn_id="turn-1",
+        thread_id="thread-1",
+        callback=published.append,
+    )
+
+    publisher({"type": "message_start", "event": {"message": {"id": "msg_1"}}})
+    publisher(
+        {
+            "type": "content_block_start",
+            "event": {"index": 0, "content_block": {"type": "text", "text": ""}},
+        }
+    )
+    publisher(
+        {
+            "type": "content_block_delta",
+            "event": {
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "hello"},
+            },
+        }
+    )
+    publisher(
+        {
+            "type": "content_block_delta",
+            "event": {
+                "index": 0,
+                "delta": {"type": "text_delta", "text": " world"},
+            },
+        }
+    )
+    publisher({"type": "content_block_stop", "event": {"index": 0}})
+
+    deltas = [
+        event.text for event in published if isinstance(event, AgentTextContentDelta)
+    ]
+
+    assert deltas == ["hello", " world"]
+    assert "".join(deltas) == "hello world"
+
+
+def test_make_agent_event_publisher_preserves_anthropic_tool_json_delta_whitespace():
+    published: list[object] = []
+    publisher = _AnthropicAgentEventPublisher(
+        emitter=_AgentMessageEmitter(
+            turn_id="turn-1",
+            thread_id="thread-1",
+            callback=published.append,
+        )
+    )
+
+    publisher({"type": "message_start", "event": {"message": {"id": "msg_1"}}})
+    publisher(
+        {
+            "type": "content_block_start",
+            "event": {
+                "index": 0,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "lookup",
+                    "input": None,
+                },
+            },
+        }
+    )
+    publisher(
+        {
+            "type": "content_block_delta",
+            "event": {
+                "index": 0,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": '{"q":"hello',
+                },
+            },
+        }
+    )
+    publisher(
+        {
+            "type": "content_block_delta",
+            "event": {
+                "index": 0,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": ' world"}',
+                },
+            },
+        }
+    )
+
+    assert publisher._blocks[0].arguments_text == '{"q":"hello world"}'
+
+    publisher({"type": "content_block_stop", "event": {"index": 0}})
+    publisher(
+        {
+            "type": "meshagent.handler.added",
+            "item": {
+                "type": "function_call",
+                "id": "toolu_1",
+                "call_id": "toolu_1",
+                "name": "lookup",
+                "arguments": '{"q":"hello world"}',
+            },
+        }
+    )
+    publisher({"type": "meshagent.handler.done", "item_id": "toolu_1"})
+
+    assert [type(event) for event in published] == [
+        AgentToolCallStarted,
+        AgentToolCallStarted,
+        AgentToolCallEnded,
+    ]
+    updated_started = published[1]
+    assert isinstance(updated_started, AgentToolCallStarted)
+    assert updated_started.arguments == {"q": "hello world"}
+    assert isinstance(published[-1], AgentToolCallEnded)
+
+
+def test_make_agent_event_publisher_unmangles_function_tool_names_from_tool_bundle():
+    adapter = AnthropicMessagesAdapter(client=object())
+    published: list[object] = []
+    publisher = adapter.make_agent_event_publisher(
+        turn_id="turn-1",
+        thread_id="thread-1",
+        callback=published.append,
+    )
+    toolkit = Toolkit(
+        name="search",
+        tools=[_AnyArgsTool("lookup/web")],
+    )
+    tool_bundle = MessagesToolBundle(toolkits=[toolkit])
+    adapter._set_function_tool_name_resolver(
+        event_handler=publisher,
+        resolver=tool_bundle.resolve_function_tool_name,
+    )
+
+    safe_name = safe_tool_name("lookup/web")
+    publisher({"type": "message_start", "event": {"message": {"id": "msg_1"}}})
+    publisher(
+        {
+            "type": "content_block_start",
+            "event": {
+                "index": 0,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": safe_name,
+                    "input": {"q": "meshagent"},
+                },
+            },
+        }
+    )
+    publisher({"type": "content_block_stop", "event": {"index": 0}})
+    publisher(
+        {
+            "type": "meshagent.handler.added",
+            "item": {
+                "type": "function_call",
+                "id": "toolu_1",
+                "call_id": "toolu_1",
+                "name": safe_name,
+                "arguments": '{"q":"meshagent"}',
+            },
+        }
+    )
+    publisher({"type": "meshagent.handler.done", "item_id": "toolu_1"})
+
+    assert [type(event) for event in published] == [
+        AgentToolCallStarted,
+        AgentToolCallEnded,
+    ]
+    started = published[0]
+    assert isinstance(started, AgentToolCallStarted)
+    assert started.toolkit == "search"
+    assert started.tool == "lookup/web"
+    assert started.arguments == {"q": "meshagent"}
+
+
+def test_make_agent_event_publisher_marks_anthropic_tool_failure() -> None:
+    adapter = AnthropicMessagesAdapter(client=object())
+    published: list[object] = []
+    publisher = adapter.make_agent_event_publisher(
+        turn_id="turn-1",
+        thread_id="thread-1",
+        callback=published.append,
+    )
+
+    publisher({"type": "message_start", "event": {"message": {"id": "msg_1"}}})
+    publisher(
+        {
+            "type": "content_block_start",
+            "event": {
+                "index": 0,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "write_file",
+                    "input": {"path": "src/app.py"},
+                },
+            },
+        }
+    )
+    publisher({"type": "content_block_stop", "event": {"index": 0}})
+    publisher(
+        {
+            "type": "meshagent.handler.added",
+            "item": {
+                "type": "function_call",
+                "id": "toolu_1",
+                "call_id": "toolu_1",
+                "name": "write_file",
+                "arguments": '{"path":"src/app.py"}',
+            },
+        }
+    )
+    publisher(
+        {
+            "type": "meshagent.handler.done",
+            "item_id": "toolu_1",
+            "error": "'text' is a required property",
+        }
+    )
+
+    assert [type(event) for event in published] == [
+        AgentToolCallStarted,
+        AgentToolCallEnded,
+    ]
+    ended = published[-1]
+    assert isinstance(ended, AgentToolCallEnded)
+    assert ended.error is not None
+    assert ended.error.message == "'text' is a required property"
