@@ -1,12 +1,14 @@
 import os
 import sys
+import asyncio
+import copy
 
 import pytest
 
 from meshagent.anthropic.messages_adapter import AnthropicMessagesAdapter
 from meshagent.anthropic.mcp import MCPConfig, MCPServer, MCPTool
 from meshagent.agents.agent import AgentSessionContext
-from meshagent.tools import Toolkit
+from meshagent.tools import FunctionTool, Toolkit
 
 
 def _import_real_anthropic_sdk():
@@ -38,9 +40,63 @@ def _import_real_anthropic_sdk():
 a = _import_real_anthropic_sdk()
 
 
+class _DummyParticipant:
+    def __init__(self):
+        self.id = "p1"
+
+    def get_attribute(self, name: str):
+        if name == "name":
+            return "tester"
+        return None
+
+
 class _DummyRoom:
-    # Adapter won't touch room when no tools.
-    pass
+    def __init__(self):
+        self.local_participant = _DummyParticipant()
+        self.developer = self
+
+    def log_nowait(self, **kwargs):
+        del kwargs
+
+
+class _SteeringProbeTool(FunctionTool):
+    def __init__(self):
+        super().__init__(
+            name="steering_probe",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "note": {"type": "string"},
+                },
+                "required": ["note"],
+                "additionalProperties": False,
+            },
+            description="A probe tool used to verify steering order across tool calls.",
+        )
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.calls: list[str] = []
+
+    async def execute(self, context, note: str) -> dict[str, object]:
+        del context
+        self.calls.append(note)
+        self.started.set()
+        await self.release.wait()
+        return {"ok": True, "note": note}
+
+
+class _RecordingAnthropicMessagesAdapter(AnthropicMessagesAdapter):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.recorded_requests: list[dict[str, object]] = []
+
+    async def _stream_message(self, *, client, request: dict, event_handler):
+        self.recorded_requests.append(copy.deepcopy(request))
+        return await super()._stream_message(
+            client=client,
+            request=request,
+            event_handler=event_handler,
+        )
 
 
 @pytest.mark.asyncio
@@ -198,3 +254,85 @@ async def test_live_anthropic_adapter_compaction_if_key_set():
     usage = ctx.metadata.get("last_response_usage")
     assert isinstance(usage, dict)
     assert int(usage.get("input_tokens", 0)) > 0
+
+
+@pytest.mark.asyncio
+async def test_live_anthropic_inserts_steer_immediately_after_tool_results_if_key_set():
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        pytest.skip("ANTHROPIC_API_KEY not set")
+
+    model = os.getenv("ANTHROPIC_STEERING_TEST_MODEL", "claude-sonnet-4-6")
+
+    client = a.AsyncAnthropic(api_key=api_key)
+    adapter = _RecordingAnthropicMessagesAdapter(model=model, client=client)
+    tool = _SteeringProbeTool()
+
+    ctx = AgentSessionContext(system_role=None)
+    ctx.append_user_message(
+        "You must call the steering_probe tool exactly once with any note string. "
+        "After the tool result is available, reply with exactly ORIGINAL and nothing else."
+    )
+
+    pending_steer = False
+
+    async def _steer() -> bool:
+        nonlocal pending_steer
+        if not pending_steer:
+            return False
+        pending_steer = False
+        ctx.append_user_message(
+            "New instruction: after the tool result, reply with exactly STEERED and nothing else."
+        )
+        return True
+
+    task = asyncio.create_task(
+        adapter.next(
+            context=ctx,
+            room=_DummyRoom(),
+            toolkits=[Toolkit(name="test", tools=[tool])],
+            event_handler=lambda event: None,
+            steering_callback=_steer,
+        )
+    )
+
+    await asyncio.wait_for(tool.started.wait(), timeout=30.0)
+    pending_steer = True
+    tool.release.set()
+    result = await asyncio.wait_for(task, timeout=90.0)
+
+    assert tool.calls
+    assert "STEERED" in result
+    assert "ORIGINAL" not in result
+    assert len(adapter.recorded_requests) >= 2
+
+    second_messages = adapter.recorded_requests[1]["messages"]
+    assert isinstance(second_messages, list)
+    assert len(second_messages) >= 4
+    assert second_messages[-3]["role"] == "assistant"
+    assert second_messages[-2]["role"] == "user"
+    assert second_messages[-2]["content"][0]["type"] == "tool_result"
+    assert second_messages[-1] == {
+        "role": "user",
+        "content": [
+            {
+                "type": "text",
+                "text": (
+                    "New instruction: after the tool result, reply with exactly "
+                    "STEERED and nothing else."
+                ),
+            }
+        ],
+    }
+    assert not any(
+        isinstance(message, dict)
+        and message.get("role") == "assistant"
+        and isinstance(message.get("content"), list)
+        and any(
+            isinstance(block, dict)
+            and block.get("type") == "text"
+            and "ORIGINAL" in block.get("text", "")
+            for block in message["content"]
+        )
+        for message in second_messages[:-1]
+    )

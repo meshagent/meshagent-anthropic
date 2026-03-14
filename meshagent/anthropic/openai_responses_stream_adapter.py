@@ -6,6 +6,7 @@ from typing import Any, Callable, Optional
 
 from meshagent.api import RoomClient, RemoteParticipant
 from meshagent.agents.agent import AgentSessionContext
+from meshagent.agents.adapter import SteeringCallback
 from meshagent.tools import Toolkit
 
 from .messages_adapter import AnthropicMessagesAdapter
@@ -394,6 +395,7 @@ class AnthropicOpenAIResponsesStreamAdapter(AnthropicMessagesAdapter):
         toolkits: list[Toolkit],
         output_schema: Optional[dict] = None,
         event_handler: Optional[Callable[[dict], None]] = None,
+        steering_callback: SteeringCallback | None = None,
         model: Optional[str] = None,
         on_behalf_of: Optional[RemoteParticipant] = None,
         options: Optional[dict] = None,
@@ -405,6 +407,7 @@ class AnthropicOpenAIResponsesStreamAdapter(AnthropicMessagesAdapter):
             toolkits=toolkits,
             output_schema=output_schema,
             event_handler=event_handler,
+            steering_callback=steering_callback,
             model=model,
             on_behalf_of=on_behalf_of,
             options=options,

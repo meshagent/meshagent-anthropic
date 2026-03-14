@@ -18,7 +18,7 @@ from meshagent.api.messaging import (
     RawOutputsContent,
     ensure_content,
 )
-from meshagent.agents.adapter import ToolResponseAdapter, LLMAdapter
+from meshagent.agents.adapter import ToolResponseAdapter, LLMAdapter, SteeringCallback
 
 import json
 from typing import Any, Optional, Callable, Literal
@@ -29,6 +29,7 @@ import re
 import asyncio
 import base64
 import mimetypes
+import copy
 from html_to_markdown import convert
 from urllib.parse import urlparse
 
@@ -802,27 +803,26 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
         http_client = get_logging_httpx_client() if self._log_requests else None
         return get_client(room=room, http_client=http_client)
 
-    def _convert_messages(
-        self, *, context: AgentSessionContext
-    ) -> tuple[list[dict], Optional[str]]:
-        system = context.get_system_instructions()
+    @staticmethod
+    def _message_to_blocks(*, role: str, content: Any) -> dict:
+        if isinstance(content, str):
+            return {"role": role, "content": [_text_block(content)]}
+        if isinstance(content, list):
+            return {"role": role, "content": content}
+        return {"role": role, "content": [_text_block(str(content))]}
 
-        def as_blocks(role: str, content: Any) -> dict:
-            if isinstance(content, str):
-                return {"role": role, "content": [_text_block(content)]}
-            if isinstance(content, list):
-                return {"role": role, "content": content}
-            return {"role": role, "content": [_text_block(str(content))]}
-
+    def _convert_message_list(
+        self, *, raw_messages: list[dict[str, Any]]
+    ) -> list[dict]:
         messages: list[dict] = []
         pending_tool_use_ids: set[str] = set()
 
-        for m in context.messages:
+        for m in raw_messages:
             role = m.get("role")
             if role not in {"user", "assistant"}:
                 continue
 
-            msg = as_blocks(role, m.get("content"))
+            msg = self._message_to_blocks(role=role, content=m.get("content"))
 
             # Anthropic requires that tool_result blocks appear in the *immediately next*
             # user message after an assistant tool_use.
@@ -866,7 +866,21 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
 
             messages.append(msg)
 
+        return messages
+
+    def _convert_messages(
+        self, *, context: AgentSessionContext
+    ) -> tuple[list[dict], Optional[str]]:
+        system = context.get_system_instructions()
+        messages = self._convert_message_list(raw_messages=context.messages)
         return messages, system
+
+    @staticmethod
+    def _strip_trailing_user_messages(*, messages: list[dict[str, Any]]) -> list[dict]:
+        trimmed_messages = list(messages)
+        while len(trimmed_messages) > 0 and trimmed_messages[-1].get("role") == "user":
+            trimmed_messages.pop()
+        return trimmed_messages
 
     def _messages_api(self, *, client: Any, request: dict) -> Any:
         # The MCP connector requires `client.beta.messages.*`.
@@ -1119,6 +1133,7 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
         toolkits: list[Toolkit],
         output_schema: Optional[dict] = None,
         event_handler: Optional[Callable[[dict], None]] = None,
+        steering_callback: SteeringCallback | None = None,
         model: Optional[str] = None,
         on_behalf_of: Optional[RemoteParticipant] = None,
         options: Optional[dict] = None,
@@ -1136,9 +1151,13 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
 
         validation_attempts = 0
         pause_turn_continuations = 0
+        context_messages_snapshot = copy.deepcopy(context.messages)
+        iteration_committed = False
 
         try:
             while True:
+                context_messages_snapshot = copy.deepcopy(context.messages)
+                iteration_committed = False
                 executable_toolkits, middleware = self._split_toolkits(
                     toolkits=toolkits
                 )
@@ -1269,11 +1288,13 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
                         "Increase max_tokens and retry."
                     )
 
-                # Keep the assistant message in context.
                 assistant_message = {"role": "assistant", "content": content_blocks}
-                context.messages.append(assistant_message)
 
                 if stop_reason == "pause_turn":
+                    context.messages.append(assistant_message)
+                    iteration_committed = True
+                    if steering_callback is not None:
+                        await steering_callback()
                     pause_turn_continuations += 1
                     if pause_turn_continuations > _MAX_PAUSE_TURN_CONTINUATIONS:
                         raise RoomException(
@@ -1340,6 +1361,16 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
                                 room=room,
                                 response=tool_response,
                             )
+                        except asyncio.CancelledError:
+                            if event_handler is not None:
+                                event_handler(
+                                    {
+                                        "type": "meshagent.handler.done",
+                                        "item_id": tool_use.get("id"),
+                                        "error": "cancelled",
+                                    }
+                                )
+                            raise
                         except Exception as ex:
                             tool_bundle.record_tool_failure(tool_use=tool_use)
                             logger.error(
@@ -1393,17 +1424,24 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
                             else:
                                 trailing_messages.append(msg)
 
+                    context.messages.append(assistant_message)
                     if tool_result_blocks:
                         context.messages.append(
                             {"role": "user", "content": tool_result_blocks}
                         )
+                    iteration_committed = True
+
+                    if steering_callback is not None:
+                        if await steering_callback():
+                            continue
 
                     for msg in trailing_messages:
                         context.messages.append(msg)
-
                     continue
 
                 # no tool calls; return final content
+                context.messages.append(assistant_message)
+                iteration_committed = True
                 text = "".join(
                     [
                         b.get("text", "")
@@ -1443,6 +1481,11 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
                         }
                     )
 
+        except asyncio.CancelledError:
+            if not iteration_committed:
+                context.messages.clear()
+                context.messages.extend(copy.deepcopy(context_messages_snapshot))
+            raise
         except APIStatusError as e:
             raise RoomException(f"Error from Anthropic: {e}")
         finally:

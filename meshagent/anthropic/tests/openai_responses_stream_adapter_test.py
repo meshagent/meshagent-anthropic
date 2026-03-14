@@ -217,6 +217,7 @@ async def test_openai_responses_stream_next_forwards_options(monkeypatch):
         toolkits,
         output_schema=None,
         event_handler=None,
+        steering_callback=None,
         model=None,
         on_behalf_of=None,
         options=None,
@@ -227,6 +228,7 @@ async def test_openai_responses_stream_next_forwards_options(monkeypatch):
         del toolkits
         del output_schema
         del event_handler
+        del steering_callback
         del model
         del on_behalf_of
         called["options"] = options
@@ -245,3 +247,56 @@ async def test_openai_responses_stream_next_forwards_options(monkeypatch):
 
     assert result == "ok"
     assert called["options"] == {"reasoning": {"effort": "none"}}
+
+
+@pytest.mark.asyncio
+async def test_openai_responses_stream_next_forwards_steering_callback(monkeypatch):
+    called: dict = {"steering_callback": None}
+
+    async def _fake_next(
+        self,
+        *,
+        context,
+        room,
+        toolkits,
+        output_schema=None,
+        event_handler=None,
+        steering_callback=None,
+        model=None,
+        on_behalf_of=None,
+        options=None,
+    ):
+        del self
+        del context
+        del room
+        del toolkits
+        del output_schema
+        del event_handler
+        del model
+        del on_behalf_of
+        del options
+        called["steering_callback"] = steering_callback
+        if steering_callback is None:
+            return False
+        return await steering_callback()
+
+    monkeypatch.setattr(AnthropicMessagesAdapter, "next", _fake_next)
+
+    adapter = AnthropicOpenAIResponsesStreamAdapter(client=object())
+    steering_calls = 0
+
+    async def _steer() -> bool:
+        nonlocal steering_calls
+        steering_calls += 1
+        return True
+
+    result = await adapter.next(
+        context=AgentSessionContext(system_role=None),
+        room=object(),
+        toolkits=[],
+        steering_callback=_steer,
+    )
+
+    assert result is True
+    assert called["steering_callback"] is _steer
+    assert steering_calls == 1
