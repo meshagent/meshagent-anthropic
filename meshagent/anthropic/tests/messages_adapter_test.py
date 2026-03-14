@@ -264,6 +264,24 @@ class _BlockingTool(FunctionTool):
         await asyncio.Future()
 
 
+class _GateTool(FunctionTool):
+    def __init__(self, name: str):
+        super().__init__(
+            name=name,
+            input_schema={"type": "object", "additionalProperties": True},
+            description="gated test tool",
+        )
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def execute(self, context, **kwargs):
+        del context
+        del kwargs
+        self.started.set()
+        await self.release.wait()
+        return {"ok": True, "tool": self.name}
+
+
 class _WriteFileLikeTool(FunctionTool):
     def __init__(self) -> None:
         super().__init__(
@@ -348,6 +366,103 @@ def test_convert_messages_raises_if_tool_result_not_immediately_next():
 
     with pytest.raises(RoomException):
         adapter._convert_messages(context=ctx)
+
+
+def test_convert_messages_keeps_real_user_turn_after_tool_result() -> None:
+    ctx = AgentSessionContext(
+        system_role=None,
+        messages=[
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "tool_a",
+                        "input": {},
+                    },
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": [{"type": "text", "text": "ok"}],
+                    }
+                ],
+            },
+            {"role": "user", "content": "stop"},
+        ],
+    )
+
+    adapter = AnthropicMessagesAdapter(client=object())
+    msgs, system = adapter._convert_messages(context=ctx)
+
+    assert system == adapter.get_additional_instructions()
+    assert msgs == [
+        {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "tool_a",
+                    "input": {},
+                },
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": [{"type": "text", "text": "ok"}],
+                }
+            ],
+        },
+        {"role": "user", "content": [{"type": "text", "text": "stop"}]},
+    ]
+
+
+def test_convert_messages_keeps_trailing_user_turn_without_tool_result() -> None:
+    ctx = AgentSessionContext(
+        system_role=None,
+        messages=[
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "working"}],
+            },
+            {"role": "user", "content": "stop"},
+        ],
+    )
+
+    adapter = AnthropicMessagesAdapter(client=object())
+    msgs, system = adapter._convert_messages(context=ctx)
+
+    assert system == adapter.get_additional_instructions()
+    assert msgs == [
+        {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "working"}],
+        },
+        {"role": "user", "content": [{"type": "text", "text": "stop"}]},
+    ]
+
+
+def test_convert_messages_appends_additional_instructions_to_existing_system() -> None:
+    adapter = AnthropicMessagesAdapter(client=object())
+    ctx = AgentSessionContext(system_role=None, instructions="base instructions")
+
+    _, system = adapter._convert_messages(context=ctx)
+
+    assert system == ("base instructions\n\n" + adapter.get_additional_instructions())
 
 
 @pytest.mark.asyncio
@@ -1062,7 +1177,7 @@ async def test_next_inserts_steering_messages_after_tool_results() -> None:
         ],
         model="claude-sonnet-4-6",
     )
-    context = AgentSessionContext(system_role=None)
+    context = adapter.create_session()
     context.append_user_message("run tool")
     steering_calls = 0
 
@@ -1098,9 +1213,97 @@ async def test_next_inserts_steering_messages_after_tool_results() -> None:
     assert second_messages[2]["content"][0]["type"] == "tool_result"
     assert second_messages[2]["content"][0]["tool_use_id"] == "toolu_1"
     assert second_messages[3] == {
+        "role": "assistant",
+        "content": [{"type": "text", "text": "TURN INTERRUPTED"}],
+    }
+    assert second_messages[4] == {
         "role": "user",
         "content": [{"type": "text", "text": "steer now"}],
     }
+    assert len(second_messages) == 5
+    assert adapter.requests[1].get("system") == adapter.get_additional_instructions()
+
+
+@pytest.mark.asyncio
+async def test_steering_followup_request_matches_plain_transcript_shape() -> None:
+    adapter = _FakeAdapter(
+        responses=[
+            {
+                "stop_reason": "tool_use",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "tool_a",
+                        "input": {"path": "/tmp/test.txt"},
+                    }
+                ],
+            },
+            {
+                "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "done"}],
+            },
+        ],
+        model="claude-sonnet-4-6",
+    )
+    context = adapter.create_session()
+    context.append_user_message("run tool")
+
+    async def _steer() -> bool:
+        context.append_user_message("steer now")
+        return True
+
+    result = await adapter.next(
+        context=context,
+        room=_DummyRoom(),
+        toolkits=[Toolkit(name="test", tools=[_AnyArgsTool("tool_a")])],
+        steering_callback=_steer,
+    )
+
+    assert result == "done"
+
+    manual_context = AgentSessionContext(
+        system_role=None,
+        messages=[
+            {"role": "user", "content": "run tool"},
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "tool_a",
+                        "input": {"path": "/tmp/test.txt"},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": '{"ok": true, "args": {"path": "/tmp/test.txt"}}',
+                            }
+                        ],
+                    }
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "TURN INTERRUPTED"}],
+            },
+            {"role": "user", "content": "steer now"},
+        ],
+    )
+
+    manual_messages, manual_system = adapter._convert_messages(context=manual_context)
+
+    assert adapter.requests[1]["messages"] == manual_messages
+    assert adapter.requests[1].get("system") == manual_system
 
 
 @pytest.mark.asyncio
@@ -1127,7 +1330,7 @@ async def test_next_inserts_steering_before_trailing_tool_messages(
         ],
         model="claude-sonnet-4-6",
     )
-    context = AgentSessionContext(system_role=None)
+    context = adapter.create_session()
     context.append_user_message("run tool")
 
     original_create_messages = AnthropicMessagesToolResponseAdapter.create_messages
@@ -1186,14 +1389,130 @@ async def test_next_inserts_steering_before_trailing_tool_messages(
     assert second_messages[2]["content"][0]["type"] == "tool_result"
     assert second_messages[2]["content"][0]["tool_use_id"] == "toolu_1"
     assert second_messages[3] == {
+        "role": "assistant",
+        "content": [{"type": "text", "text": "TURN INTERRUPTED"}],
+    }
+    assert second_messages[4] == {
         "role": "user",
         "content": [{"type": "text", "text": "steer now"}],
     }
+    assert len(second_messages) == 5
+    assert adapter.requests[1].get("system") == adapter.get_additional_instructions()
     assert not any(
         message.get("role") == "assistant"
         and message.get("content") == [{"type": "text", "text": "too late"}]
         for message in second_messages
     )
+
+
+@pytest.mark.asyncio
+async def test_next_inserts_steering_after_first_completed_tool_when_multiple_tools_are_pending() -> (
+    None
+):
+    adapter = _FakeAdapter(
+        responses=[
+            {
+                "stop_reason": "tool_use",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "tool_a",
+                        "input": {},
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_2",
+                        "name": "tool_b",
+                        "input": {},
+                    },
+                ],
+            },
+            {
+                "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "done"}],
+            },
+        ],
+        model="claude-sonnet-4-6",
+    )
+    tool_a = _GateTool("tool_a")
+    tool_b = _BlockingTool("tool_b")
+    context = adapter.create_session()
+    context.append_user_message("run tools")
+    pending_steer = False
+
+    async def _steer() -> bool:
+        nonlocal pending_steer
+        if not pending_steer:
+            return False
+        pending_steer = False
+        context.append_user_message("steer now")
+        return True
+
+    task = asyncio.create_task(
+        adapter.next(
+            context=context,
+            room=_DummyRoom(),
+            toolkits=[Toolkit(name="test", tools=[tool_a, tool_b])],
+            steering_callback=_steer,
+        )
+    )
+
+    await asyncio.wait_for(tool_a.started.wait(), timeout=1)
+    await asyncio.wait_for(tool_b.started.wait(), timeout=1)
+    pending_steer = True
+    tool_a.release.set()
+    result = await asyncio.wait_for(task, timeout=1)
+
+    assert result == "done"
+    assert len(adapter.requests) == 2
+    second_messages = adapter.requests[1]["messages"]
+    assert second_messages[1] == {
+        "role": "assistant",
+        "content": [
+            {"type": "tool_use", "id": "toolu_1", "name": "tool_a", "input": {}},
+            {"type": "tool_use", "id": "toolu_2", "name": "tool_b", "input": {}},
+        ],
+    }
+    assert second_messages[2]["role"] == "user"
+    assert any(
+        isinstance(block, dict)
+        and block.get("type") == "tool_result"
+        and block.get("tool_use_id") == "toolu_1"
+        for block in second_messages[2]["content"]
+    )
+    assert second_messages[2] == {
+        "role": "user",
+        "content": [
+            {
+                "type": "tool_result",
+                "tool_use_id": "toolu_1",
+                "content": [{"type": "text", "text": '{"ok": true, "tool": "tool_a"}'}],
+            },
+            {
+                "type": "tool_result",
+                "tool_use_id": "toolu_2",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "Cancelled because queued steering took priority over the remaining tool calls."
+                        ),
+                    }
+                ],
+            },
+        ],
+    }
+    assert second_messages[3] == {
+        "role": "assistant",
+        "content": [{"type": "text", "text": "TURN INTERRUPTED"}],
+    }
+    assert second_messages[4] == {
+        "role": "user",
+        "content": [{"type": "text", "text": "steer now"}],
+    }
+    assert adapter.requests[1].get("system") == adapter.get_additional_instructions()
+    assert len(second_messages) == 5
 
 
 @pytest.mark.asyncio

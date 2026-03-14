@@ -55,6 +55,12 @@ _COMPACTION_BETA = "compact-2026-01-12"
 ToolCallingMode = Literal["loose", "strict", "explicit", "adaptive"]
 _LEGACY_ANTHROPIC_MAX_TOKENS = 8192
 _MAX_PAUSE_TURN_CONTINUATIONS = 5
+_ANTHROPIC_STEERING_MARKER = "TURN INTERRUPTED"
+_ANTHROPIC_STEERING_INSTRUCTIONS = (
+    "If the transcript contains an assistant message exactly equal to "
+    f"'{_ANTHROPIC_STEERING_MARKER}', then treat the immediately following user "
+    "message as steering that takes precedence over any unfinished prior plan."
+)
 
 
 class _AnthropicToolCallingState:
@@ -128,6 +134,7 @@ def _normalize_anthropic_union_types(value: Any) -> Any:
     normalized_types = [item for item in type_value if isinstance(item, str)]
     if len(normalized_types) == 0:
         return normalized
+
     if len(normalized_types) == 1:
         normalized["type"] = normalized_types[0]
         return normalized
@@ -145,6 +152,41 @@ def _normalize_anthropic_union_types(value: Any) -> Any:
 
     normalized = {"anyOf": any_of}
     return _strip_empty_object_compound_wrapper(normalized)
+
+
+def _content_blocks_to_text(*, content: list[dict[str, Any]]) -> str:
+    text_parts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+
+        block_type = block.get("type")
+        if block_type == "text":
+            text = block.get("text")
+            if isinstance(text, str) and text.strip() != "":
+                text_parts.append(text.strip())
+            continue
+
+        if block_type == "image":
+            source = block.get("source")
+            if isinstance(source, dict):
+                media_type = source.get("media_type")
+                if isinstance(media_type, str) and media_type.strip() != "":
+                    text_parts.append(
+                        f"the user attached an image ({media_type.strip()})"
+                    )
+                    continue
+            text_parts.append("the user attached an image")
+            continue
+
+        if block_type == "file":
+            file_name = block.get("filename")
+            if isinstance(file_name, str) and file_name.strip() != "":
+                text_parts.append(f"the user attached a file: {file_name.strip()}")
+                continue
+            text_parts.append("the user attached a file")
+
+    return "\n\n".join(text_parts)
 
 
 def _lower_nullable_object_properties(value: Any) -> Any:
@@ -278,6 +320,58 @@ def _as_jsonable(obj: Any) -> Any:
 
 def _text_block(text: str) -> dict:
     return {"type": "text", "text": text}
+
+
+def _tool_result_message(
+    *,
+    tool_use_id: str | None,
+    content: list[dict],
+) -> dict:
+    return {
+        "role": "user",
+        "content": [
+            {
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": content,
+            }
+        ],
+    }
+
+
+def _cancelled_tool_result_message(*, tool_use: dict) -> dict:
+    return _tool_result_message(
+        tool_use_id=tool_use.get("id"),
+        content=[
+            _text_block(
+                "Cancelled because queued steering took priority over the remaining tool calls."
+            )
+        ],
+    )
+
+
+def _split_tool_execution_messages(
+    results: list[list[dict]],
+) -> tuple[list[dict], list[dict]]:
+    tool_result_blocks: list[dict] = []
+    trailing_messages: list[dict] = []
+
+    for msgs in results:
+        for msg in msgs:
+            if (
+                isinstance(msg, dict)
+                and msg.get("role") == "user"
+                and isinstance(msg.get("content"), list)
+                and all(
+                    isinstance(block, dict) and block.get("type") == "tool_result"
+                    for block in msg["content"]
+                )
+            ):
+                tool_result_blocks.extend(msg["content"])
+            else:
+                trailing_messages.append(msg)
+
+    return tool_result_blocks, trailing_messages
 
 
 async def _consume_streaming_tool_result(
@@ -756,6 +850,13 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
     def default_model(self) -> str:
         return self._model
 
+    def get_additional_instructions(self) -> str | None:
+        return _ANTHROPIC_STEERING_INSTRUCTIONS
+
+    def on_turn_steer(self, *, context: AgentSessionContext, interrupted: bool) -> None:
+        del interrupted
+        context.append_assistant_message(_ANTHROPIC_STEERING_MARKER)
+
     def _resolved_max_tokens(self, *, model: str) -> int:
         if self._max_tokens is not None:
             return self._max_tokens
@@ -871,7 +972,15 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
     def _convert_messages(
         self, *, context: AgentSessionContext
     ) -> tuple[list[dict], Optional[str]]:
-        system = context.get_system_instructions()
+        system_parts = [
+            part
+            for part in (
+                context.get_system_instructions(),
+                self.get_additional_instructions(),
+            )
+            if isinstance(part, str) and part.strip() != ""
+        ]
+        system = "\n\n".join(system_parts) if len(system_parts) > 0 else None
         messages = self._convert_message_list(raw_messages=context.messages)
         return messages, system
 
@@ -1152,11 +1261,30 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
         validation_attempts = 0
         pause_turn_continuations = 0
         context_messages_snapshot = copy.deepcopy(context.messages)
+        context_metadata_snapshot = copy.deepcopy(context.metadata)
         iteration_committed = False
 
         try:
+
+            async def apply_steering() -> bool:
+                if steering_callback is None:
+                    return False
+
+                message_count_before = len(context.messages)
+                steered = await steering_callback()
+                if steered:
+                    if len(context.messages) > message_count_before:
+                        trailing_messages = context.messages[message_count_before:]
+                        del context.messages[message_count_before:]
+                    else:
+                        trailing_messages = []
+                    self.on_turn_steer(context=context, interrupted=False)
+                    context.messages.extend(trailing_messages)
+                return steered
+
             while True:
                 context_messages_snapshot = copy.deepcopy(context.messages)
+                context_metadata_snapshot = copy.deepcopy(context.metadata)
                 iteration_committed = False
                 executable_toolkits, middleware = self._split_toolkits(
                     toolkits=toolkits
@@ -1293,8 +1421,7 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
                 if stop_reason == "pause_turn":
                     context.messages.append(assistant_message)
                     iteration_committed = True
-                    if steering_callback is not None:
-                        await steering_callback()
+                    await apply_steering()
                     pause_turn_continuations += 1
                     if pause_turn_continuations > _MAX_PAUSE_TURN_CONTINUATIONS:
                         raise RoomException(
@@ -1303,7 +1430,8 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
                     continue
 
                 if tool_uses:
-                    tasks = []
+                    completed_results: list[list[dict]] = []
+                    steering_applied = False
 
                     async def do_tool(tool_use: dict) -> list[dict]:
                         tool_context = ToolContext(
@@ -1385,44 +1513,104 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
                                         "error": f"{ex}",
                                     }
                                 )
-                            tool_result_content = [_text_block(f"Error: {ex}")]
-                            message = {
-                                "role": "user",
-                                "content": [
-                                    {
-                                        "type": "tool_result",
-                                        "tool_use_id": tool_use.get("id"),
-                                        "content": tool_result_content,
-                                    }
-                                ],
-                            }
-                            return [message]
-
-                    for tool_use in tool_uses:
-                        tasks.append(asyncio.create_task(do_tool(tool_use)))
-
-                    results = await asyncio.gather(*tasks)
-
-                    # Anthropic requires tool_result blocks for *all* tool_use ids to appear in the
-                    # *immediately next* user message after the assistant tool_use message.
-                    tool_result_blocks: list[dict] = []
-                    trailing_messages: list[dict] = []
-
-                    for msgs in results:
-                        for msg in msgs:
-                            if (
-                                isinstance(msg, dict)
-                                and msg.get("role") == "user"
-                                and isinstance(msg.get("content"), list)
-                                and all(
-                                    isinstance(b, dict)
-                                    and b.get("type") == "tool_result"
-                                    for b in msg["content"]
+                            return [
+                                _tool_result_message(
+                                    tool_use_id=tool_use.get("id"),
+                                    content=[_text_block(f"Error: {ex}")],
                                 )
-                            ):
-                                tool_result_blocks.extend(msg["content"])
-                            else:
-                                trailing_messages.append(msg)
+                            ]
+
+                    pending_tasks: dict[asyncio.Task[list[dict]], dict] = {
+                        asyncio.create_task(do_tool(tool_use)): tool_use
+                        for tool_use in tool_uses
+                    }
+
+                    while pending_tasks:
+                        done, _ = await asyncio.wait(
+                            list(pending_tasks.keys()),
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        for task in done:
+                            tool_use = pending_tasks.pop(task)
+                            del tool_use
+                            completed_results.append(await task)
+
+                        if steering_callback is None:
+                            continue
+
+                        provisional_tool_result_blocks, _ = (
+                            _split_tool_execution_messages(completed_results)
+                        )
+                        if pending_tasks:
+                            for tool_use in pending_tasks.values():
+                                provisional_tool_result_blocks.extend(
+                                    _cancelled_tool_result_message(tool_use=tool_use)[
+                                        "content"
+                                    ]
+                                )
+
+                        context.messages.append(assistant_message)
+                        tool_result_message_index: int | None = None
+                        if provisional_tool_result_blocks:
+                            tool_result_message_index = len(context.messages)
+                            context.messages.append(
+                                {
+                                    "role": "user",
+                                    "content": provisional_tool_result_blocks,
+                                }
+                            )
+
+                        if await apply_steering():
+                            if pending_tasks:
+                                tasks_to_cancel = list(pending_tasks.keys())
+                                cancelled_tool_uses = [
+                                    pending_tasks[task] for task in tasks_to_cancel
+                                ]
+                                for task in tasks_to_cancel:
+                                    task.cancel()
+                                cancelled_results = await asyncio.gather(
+                                    *tasks_to_cancel,
+                                    return_exceptions=True,
+                                )
+                                for tool_use, cancelled_result in zip(
+                                    cancelled_tool_uses, cancelled_results
+                                ):
+                                    if isinstance(cancelled_result, list):
+                                        completed_results.append(cancelled_result)
+                                    else:
+                                        completed_results.append(
+                                            [
+                                                _cancelled_tool_result_message(
+                                                    tool_use=tool_use
+                                                )
+                                            ]
+                                        )
+                                final_tool_result_blocks, _ = (
+                                    _split_tool_execution_messages(completed_results)
+                                )
+                                if (
+                                    final_tool_result_blocks
+                                    and tool_result_message_index is not None
+                                    and tool_result_message_index
+                                    < len(context.messages)
+                                ):
+                                    context.messages[tool_result_message_index] = {
+                                        "role": "user",
+                                        "content": final_tool_result_blocks,
+                                    }
+                                pending_tasks.clear()
+                            iteration_committed = True
+                            steering_applied = True
+                            break
+
+                        context.messages[:] = copy.deepcopy(context_messages_snapshot)
+
+                    if steering_applied:
+                        continue
+
+                    tool_result_blocks, trailing_messages = (
+                        _split_tool_execution_messages(completed_results)
+                    )
 
                     context.messages.append(assistant_message)
                     if tool_result_blocks:
@@ -1431,9 +1619,8 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
                         )
                     iteration_committed = True
 
-                    if steering_callback is not None:
-                        if await steering_callback():
-                            continue
+                    if await apply_steering():
+                        continue
 
                     for msg in trailing_messages:
                         context.messages.append(msg)
@@ -1485,6 +1672,8 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
             if not iteration_committed:
                 context.messages.clear()
                 context.messages.extend(copy.deepcopy(context_messages_snapshot))
+                context.metadata.clear()
+                context.metadata.update(copy.deepcopy(context_metadata_snapshot))
             raise
         except APIStatusError as e:
             raise RoomException(f"Error from Anthropic: {e}")
