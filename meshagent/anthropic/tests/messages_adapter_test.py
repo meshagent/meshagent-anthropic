@@ -12,6 +12,8 @@ from meshagent.agents.messages import (
     AgentTextContentDelta,
     AgentTextContentEnded,
     AgentTextContentStarted,
+    AgentToolCallLogDelta,
+    AgentToolCallPending,
     AgentToolCallEnded,
     AgentToolCallStarted,
 )
@@ -510,6 +512,36 @@ async def test_next_batches_multiple_tool_results_into_single_user_message():
         "toolu_1",
         "toolu_2",
     }
+
+
+def test_make_agent_event_publisher_emits_tool_log_delta() -> None:
+    adapter = AnthropicMessagesAdapter(client=object())
+    published: list[object] = []
+    publisher = adapter.make_agent_event_publisher(
+        turn_id="turn-1",
+        thread_id="thread-1",
+        callback=published.append,
+    )
+
+    publisher(
+        {
+            "type": "meshagent.handler.output",
+            "item_id": "toolu_1",
+            "lines": [
+                {"source": "stdout", "text": "line-1"},
+                {"source": "stdout", "text": "line-2"},
+            ],
+        }
+    )
+
+    assert len(published) == 1
+    log_delta = published[0]
+    assert isinstance(log_delta, AgentToolCallLogDelta)
+    assert log_delta.item_id == "toolu_1"
+    assert [(line.source, line.text) for line in log_delta.lines] == [
+        ("stdout", "line-1"),
+        ("stdout", "line-2"),
+    ]
 
 
 @pytest.mark.asyncio
@@ -2206,8 +2238,10 @@ def test_make_agent_event_publisher_emits_native_anthropic_messages() -> None:
         AgentFileContentStarted,
         AgentFileContentDelta,
         AgentFileContentEnded,
+        AgentToolCallPending,
         AgentToolCallStarted,
         AgentToolCallEnded,
+        AgentToolCallPending,
         AgentToolCallStarted,
         AgentToolCallEnded,
     ]
@@ -2228,13 +2262,24 @@ def test_make_agent_event_publisher_emits_native_anthropic_messages() -> None:
     assert isinstance(file_delta, AgentFileContentDelta)
     assert file_delta.url == "https://example.com/report.pdf"
 
-    function_started = published[9]
+    function_pending = published[9]
+    assert isinstance(function_pending, AgentToolCallPending)
+    assert function_pending.toolkit == "function"
+    assert function_pending.tool == "lookup"
+    assert function_pending.arguments == {"q": "meshagent"}
+
+    function_started = published[10]
     assert isinstance(function_started, AgentToolCallStarted)
     assert function_started.toolkit == "function"
     assert function_started.tool == "lookup"
     assert function_started.arguments == {"q": "meshagent"}
 
-    mcp_started = published[11]
+    mcp_pending = published[12]
+    assert isinstance(mcp_pending, AgentToolCallPending)
+    assert mcp_pending.toolkit == "deepwiki"
+    assert mcp_pending.tool == "search"
+
+    mcp_started = published[13]
     assert isinstance(mcp_started, AgentToolCallStarted)
     assert mcp_started.toolkit == "deepwiki"
     assert mcp_started.tool == "search"
@@ -2352,11 +2397,15 @@ def test_make_agent_event_publisher_preserves_anthropic_tool_json_delta_whitespa
     publisher({"type": "meshagent.handler.done", "item_id": "toolu_1"})
 
     assert [type(event) for event in published] == [
-        AgentToolCallStarted,
+        AgentToolCallPending,
+        AgentToolCallPending,
         AgentToolCallStarted,
         AgentToolCallEnded,
     ]
-    updated_started = published[1]
+    updated_pending = published[1]
+    assert isinstance(updated_pending, AgentToolCallPending)
+    assert updated_pending.arguments == {"q": "hello world"}
+    updated_started = published[2]
     assert isinstance(updated_started, AgentToolCallStarted)
     assert updated_started.arguments == {"q": "hello world"}
     assert isinstance(published[-1], AgentToolCallEnded)
@@ -2412,10 +2461,17 @@ def test_make_agent_event_publisher_unmangles_function_tool_names_from_tool_bund
     publisher({"type": "meshagent.handler.done", "item_id": "toolu_1"})
 
     assert [type(event) for event in published] == [
+        AgentToolCallPending,
         AgentToolCallStarted,
         AgentToolCallEnded,
     ]
-    started = published[0]
+    pending = published[0]
+    assert isinstance(pending, AgentToolCallPending)
+    assert pending.toolkit == "search"
+    assert pending.tool == "lookup/web"
+    assert pending.arguments == {"q": "meshagent"}
+
+    started = published[1]
     assert isinstance(started, AgentToolCallStarted)
     assert started.toolkit == "search"
     assert started.tool == "lookup/web"
@@ -2468,6 +2524,7 @@ def test_make_agent_event_publisher_marks_anthropic_tool_failure() -> None:
     )
 
     assert [type(event) for event in published] == [
+        AgentToolCallPending,
         AgentToolCallStarted,
         AgentToolCallEnded,
     ]

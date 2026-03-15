@@ -1434,11 +1434,16 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
                     steering_applied = False
 
                     async def do_tool(tool_use: dict) -> list[dict]:
+                        caller_context: dict[str, Any] = {"chat": context.to_json()}
+                        tool_use_id = tool_use.get("id")
+                        if isinstance(tool_use_id, str):
+                            caller_context["item_id"] = tool_use_id
                         tool_context = ToolContext(
                             room=room,
                             caller=room.local_participant,
                             on_behalf_of=on_behalf_of,
-                            caller_context={"chat": context.to_json()},
+                            caller_context=caller_context,
+                            event_handler=event_handler,
                             validation_mode=tool_bundle.validation_mode_for_tool_use(
                                 tool_use=tool_use
                             ),
