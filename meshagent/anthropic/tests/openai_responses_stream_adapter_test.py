@@ -72,6 +72,19 @@ class _FakeClient:
         )()
 
 
+def test_openai_responses_stream_adapter_inherits_tool_truncation_limits() -> None:
+    adapter = AnthropicOpenAIResponsesStreamAdapter(
+        client=object(),
+        max_tool_call_length=444,
+        max_tool_call_lines=12,
+    )
+
+    tool_adapter = adapter._make_tool_response_adapter()
+
+    assert tool_adapter.max_tool_call_length == 444
+    assert tool_adapter.max_tool_call_lines == 12
+
+
 @pytest.mark.asyncio
 async def test_openai_responses_stream_emits_content_part_events():
     events = [

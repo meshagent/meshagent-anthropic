@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import pytest
 from typing import Any
 
@@ -31,7 +32,7 @@ from meshagent.anthropic.messages_adapter import (
     safe_tool_name,
 )
 from meshagent.agents.agent import AgentSessionContext
-from meshagent.api.messaging import JsonContent, TextContent
+from meshagent.api.messaging import FileContent, JsonContent, TextContent
 from meshagent.tools import FunctionTool, Toolkit, ToolContext
 from meshagent.api import RoomException
 
@@ -53,6 +54,57 @@ class _DummyRoom:
 
     def log_nowait(self, **kwargs):
         del kwargs
+
+
+@pytest.mark.asyncio
+async def test_anthropic_tool_response_adapter_truncates_text_output() -> None:
+    adapter = AnthropicMessagesToolResponseAdapter(
+        max_tool_call_length=16,
+        max_tool_call_lines=2,
+    )
+
+    output = await adapter.to_plain_text(
+        room=_DummyRoom(),
+        response=TextContent(text="line1\nline2\nline3\nline4"),
+    )
+
+    assert "line1\nline2" in output
+    assert "line3" not in output
+    assert "The tool call returned too much data and was truncated." in output
+
+
+@pytest.mark.asyncio
+async def test_anthropic_tool_response_adapter_truncates_text_file_output() -> None:
+    adapter = AnthropicMessagesToolResponseAdapter(
+        max_tool_call_length=16,
+        max_tool_call_lines=2,
+    )
+
+    output = await adapter.to_plain_text(
+        room=_DummyRoom(),
+        response=FileContent(
+            data=b"line1\nline2\nline3\nline4",
+            name="notes.txt",
+            mime_type="text/plain",
+        ),
+    )
+
+    assert "line1\nline2" in output
+    assert "line3" not in output
+    assert "The tool call returned too much data and was truncated." in output
+
+
+def test_anthropic_adapter_passes_through_tool_truncation_limits() -> None:
+    adapter = AnthropicMessagesAdapter(
+        client=object(),
+        max_tool_call_length=222,
+        max_tool_call_lines=11,
+    )
+
+    tool_adapter = adapter._make_tool_response_adapter()
+
+    assert tool_adapter.max_tool_call_length == 222
+    assert tool_adapter.max_tool_call_lines == 11
 
 
 class _AnyArgsTool(FunctionTool):
@@ -213,6 +265,37 @@ class _FakeAdapter(AnthropicMessagesAdapter):
         self.requests.append(request)
         resp = self._responses[self._idx]
         self._idx += 1
+        return resp
+
+
+class _CountedFakeAdapter(_FakeAdapter):
+    def __init__(
+        self,
+        responses: list[dict | Exception],
+        *,
+        input_token_counts: list[int],
+        **kwargs,
+    ):
+        super().__init__(responses=responses, **kwargs)
+        self._input_token_counts = input_token_counts
+        self.count_requests: list[dict] = []
+
+    async def _count_request_input_tokens(self, *, client, request):
+        del client
+        self.count_requests.append(copy.deepcopy(request))
+        if len(self._input_token_counts) == 0:
+            raise AssertionError("unexpected token count request")
+        return self._input_token_counts.pop(0)
+
+    async def _create_with_optional_headers(self, *, client, request):
+        if self._idx >= len(self._responses):
+            raise AssertionError("unexpected extra request")
+        del client
+        self.requests.append(copy.deepcopy(request))
+        resp = self._responses[self._idx]
+        self._idx += 1
+        if isinstance(resp, Exception):
+            raise resp
         return resp
 
 
@@ -1858,6 +1941,12 @@ def test_constructor_rejects_invalid_compaction_threshold() -> None:
         AnthropicMessagesAdapter(client=object(), compaction_threshold=49999)
 
 
+def test_constructor_defaults_context_management_to_auto() -> None:
+    adapter = AnthropicMessagesAdapter(client=object())
+
+    assert adapter._context_management_mode == "auto"
+
+
 @pytest.mark.asyncio
 async def test_next_adds_auto_compaction_request_fields() -> None:
     adapter = _FakeAdapter(
@@ -1935,6 +2024,96 @@ async def test_next_skips_auto_compaction_for_legacy_model_versions() -> None:
     request = adapter.requests[0]
     assert "context_management" not in request
     assert "betas" not in request
+
+
+@pytest.mark.asyncio
+async def test_next_locally_compacts_anthropic_request_before_send() -> None:
+    adapter = _CountedFakeAdapter(
+        responses=[{"content": [{"type": "text", "text": "ok"}]}],
+        input_token_counts=[980_000, 920_000],
+        model="claude-sonnet-4-6",
+        context_management="auto",
+        max_tokens=64_000,
+    )
+    context = AgentSessionContext(system_role=None)
+    context.append_user_message("old user")
+    context.append_assistant_message("old assistant")
+    context.append_user_message("latest user")
+    context.metadata["last_response_usage"] = {"input_tokens": 200_000}
+
+    result = await adapter.next(
+        context=context,
+        room=_DummyRoom(),
+        toolkits=[],
+    )
+
+    assert result == "ok"
+    assert len(adapter.requests) == 1
+    assert adapter.requests[0]["messages"] == [
+        {"role": "user", "content": [{"type": "text", "text": "latest user"}]}
+    ]
+    assert context.messages == [
+        {"role": "user", "content": "latest user"},
+        {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+    ]
+    assert context.metadata["last_local_compaction"] == {
+        "model": "claude-sonnet-4-6",
+        "dropped_messages": 2,
+        "input_tokens_before": 980_000,
+        "input_tokens_after": 920_000,
+        "usable_input_token_limit": 931_904,
+    }
+
+
+@pytest.mark.asyncio
+async def test_next_retries_after_prompt_too_long_with_local_compaction(
+    monkeypatch,
+) -> None:
+    class _FakePromptTooLongError(Exception):
+        pass
+
+    monkeypatch.setattr(
+        "meshagent.anthropic.messages_adapter.APIStatusError",
+        _FakePromptTooLongError,
+    )
+
+    adapter = _CountedFakeAdapter(
+        responses=[
+            _FakePromptTooLongError(
+                "Error code: 400 - prompt is too long: 2368189 tokens > 1000000 maximum"
+            ),
+            {"content": [{"type": "text", "text": "ok"}]},
+        ],
+        input_token_counts=[980_000, 920_000],
+        model="claude-sonnet-4-6",
+        context_management="auto",
+        max_tokens=64_000,
+    )
+    context = AgentSessionContext(system_role=None)
+    context.append_user_message("old user")
+    context.append_assistant_message("old assistant")
+    context.append_user_message("latest user")
+
+    result = await adapter.next(
+        context=context,
+        room=_DummyRoom(),
+        toolkits=[],
+    )
+
+    assert result == "ok"
+    assert len(adapter.requests) == 2
+    assert adapter.requests[0]["messages"] == [
+        {"role": "user", "content": [{"type": "text", "text": "old user"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "old assistant"}]},
+        {"role": "user", "content": [{"type": "text", "text": "latest user"}]},
+    ]
+    assert adapter.requests[1]["messages"] == [
+        {"role": "user", "content": [{"type": "text", "text": "latest user"}]}
+    ]
+    assert context.messages == [
+        {"role": "user", "content": "latest user"},
+        {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+    ]
 
 
 @pytest.mark.asyncio

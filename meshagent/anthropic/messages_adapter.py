@@ -18,7 +18,13 @@ from meshagent.api.messaging import (
     RawOutputsContent,
     ensure_content,
 )
-from meshagent.agents.adapter import ToolResponseAdapter, LLMAdapter, SteeringCallback
+from meshagent.agents.adapter import (
+    DEFAULT_MAX_TOOL_CALL_LENGTH,
+    DEFAULT_MAX_TOOL_CALL_LINES,
+    ToolResponseAdapter,
+    LLMAdapter,
+    SteeringCallback,
+)
 
 import json
 from typing import Any, Optional, Callable, Literal
@@ -55,6 +61,11 @@ _COMPACTION_BETA = "compact-2026-01-12"
 ToolCallingMode = Literal["loose", "strict", "explicit", "adaptive"]
 _LEGACY_ANTHROPIC_MAX_TOKENS = 8192
 _MAX_PAUSE_TURN_CONTINUATIONS = 5
+_ANTHROPIC_STANDARD_CONTEXT_WINDOW = 200_000
+_ANTHROPIC_LONG_CONTEXT_WINDOW = 1_000_000
+_ANTHROPIC_LOCAL_COMPACTION_SAFETY_MARGIN = 4_096
+_ANTHROPIC_LOCAL_COMPACTION_PREFLIGHT_CHAR_THRESHOLD = 200_000
+_ANTHROPIC_APPROX_CHARS_PER_TOKEN = 4
 _ANTHROPIC_STEERING_MARKER = "TURN INTERRUPTED"
 _ANTHROPIC_STEERING_INSTRUCTIONS = (
     "If the transcript contains an assistant message exactly equal to "
@@ -114,6 +125,34 @@ def _default_max_tokens_for_model(model: str) -> int:
     if normalized_model.startswith("claude-opus-4"):
         return 32_000
     return _LEGACY_ANTHROPIC_MAX_TOKENS
+
+
+def _usage_number(value: Any) -> float:
+    try:
+        return float(value or 0)
+    except Exception:
+        return 0.0
+
+
+def _total_input_tokens_from_usage(usage: object) -> int:
+    if not isinstance(usage, dict):
+        return 0
+
+    return int(
+        _usage_number(usage.get("input_tokens"))
+        + _usage_number(usage.get("cache_creation_input_tokens"))
+        + _usage_number(usage.get("cache_read_input_tokens"))
+    )
+
+
+def _message_has_block_type(*, message: dict[str, Any], block_type: str) -> bool:
+    content = message.get("content")
+    if not isinstance(content, list):
+        return False
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == block_type:
+            return True
+    return False
 
 
 def _normalize_anthropic_union_types(value: Any) -> Any:
@@ -682,7 +721,30 @@ class MessagesToolBundle:
 
 
 class AnthropicMessagesToolResponseAdapter(ToolResponseAdapter):
+    def __init__(
+        self,
+        *,
+        max_tool_call_length: int = DEFAULT_MAX_TOOL_CALL_LENGTH,
+        max_tool_call_lines: int = DEFAULT_MAX_TOOL_CALL_LINES,
+    ):
+        super().__init__(
+            max_tool_call_length=max_tool_call_length,
+            max_tool_call_lines=max_tool_call_lines,
+        )
+
     async def to_plain_text(self, *, room: RoomClient, response: Content) -> str:
+        text_file = await self.file_content_to_text_content(
+            room=room,
+            content=response,
+        )
+        if text_file is not None:
+            if isinstance(response, FileContent) and _is_html_mime_type(
+                response.mime_type
+            ):
+                text_file = TextContent(text=convert(text_file.text))
+            response = self.truncate(room=room, content=text_file)
+        else:
+            response = self.truncate(room=room, content=response)
         if isinstance(response, LinkContent):
             return json.dumps({"name": response.name, "url": response.url})
         if isinstance(response, JsonContent):
@@ -722,11 +784,20 @@ class AnthropicMessagesToolResponseAdapter(ToolResponseAdapter):
         try:
             if isinstance(response, FileContent):
                 mime_type = (response.mime_type or "").lower()
+                text_file = await self.file_content_to_text_content(
+                    room=room,
+                    content=response,
+                )
 
                 if mime_type == "image/jpg":
                     mime_type = "image/jpeg"
 
-                if mime_type.startswith("image/"):
+                if text_file is not None:
+                    if _is_html_mime_type(mime_type):
+                        text_file = TextContent(text=convert(text_file.text))
+                    output = await self.to_plain_text(room=room, response=text_file)
+                    tool_result_content = [_text_block(output)]
+                elif mime_type.startswith("image/"):
                     allowed = {"image/jpeg", "image/png", "image/gif", "image/webp"}
                     if mime_type not in allowed:
                         output = f"{response.name} was returned as {response.mime_type}, which Anthropic does not accept as an image block"
@@ -757,17 +828,6 @@ class AnthropicMessagesToolResponseAdapter(ToolResponseAdapter):
                             },
                         }
                     ]
-
-                elif (
-                    mime_type.startswith("text/")
-                    or mime_type == "application/json"
-                    or mime_type == "application/xhtml+xml"
-                ):
-                    if _is_html_mime_type(mime_type):
-                        text = convert(_decode_text(response.data))
-                    else:
-                        text = _decode_text(response.data)
-                    tool_result_content = [_text_block(text)]
 
                 else:
                     output = await self.to_plain_text(room=room, response=response)
@@ -814,11 +874,14 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
         message_options: Optional[dict] = None,
         provider: str = "anthropic",
         log_requests: bool = False,
-        context_management: Literal["auto", "none"] = "none",
+        context_management: Literal["auto", "none"] = "auto",
         compaction_threshold: int = 150000,
         compaction_pause_after: bool = False,
         compaction_instructions: Optional[str] = None,
         tool_calling_mode: ToolCallingMode = "adaptive",
+        *,
+        max_tool_call_length: int = DEFAULT_MAX_TOOL_CALL_LENGTH,
+        max_tool_call_lines: int = DEFAULT_MAX_TOOL_CALL_LINES,
     ):
         if context_management not in ("auto", "none"):
             raise ValueError("context_management must be one of 'auto' or 'none'")
@@ -845,6 +908,8 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
         self._compaction_threshold = compaction_threshold
         self._compaction_pause_after = compaction_pause_after
         self._compaction_instructions = compaction_instructions
+        self._max_tool_call_length = max_tool_call_length
+        self._max_tool_call_lines = max_tool_call_lines
         self._tool_calling_state = _AnthropicToolCallingState(mode=tool_calling_mode)
 
     def default_model(self) -> str:
@@ -862,6 +927,40 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
             return self._max_tokens
         return _default_max_tokens_for_model(model)
 
+    def context_window_size(self, model: str) -> float:
+        normalized_model = model.strip().lower()
+        if normalized_model == "":
+            return float(_ANTHROPIC_STANDARD_CONTEXT_WINDOW)
+
+        direct_match = re.match(r"^claude-(sonnet|opus)-(\d+)", normalized_model)
+        if direct_match is not None:
+            major = int(direct_match.group(2))
+            if major >= 4:
+                return float(_ANTHROPIC_LONG_CONTEXT_WINDOW)
+            return float(_ANTHROPIC_STANDARD_CONTEXT_WINDOW)
+
+        legacy_match = re.match(
+            r"^claude-(\d+)-(\d+)-(sonnet|opus)(?:-|$)",
+            normalized_model,
+        )
+        if legacy_match is not None:
+            major = int(legacy_match.group(1))
+            if major >= 4:
+                return float(_ANTHROPIC_LONG_CONTEXT_WINDOW)
+            return float(_ANTHROPIC_STANDARD_CONTEXT_WINDOW)
+
+        return float(_ANTHROPIC_STANDARD_CONTEXT_WINDOW)
+
+    def _usable_input_token_limit(self, *, model: str) -> int | None:
+        context_window = self.context_window_size(model)
+        if context_window == float("inf"):
+            return None
+
+        usable_limit = int(context_window)
+        usable_limit -= self._resolved_max_tokens(model=model)
+        usable_limit -= _ANTHROPIC_LOCAL_COMPACTION_SAFETY_MARGIN
+        return max(0, usable_limit)
+
     def _stop_reason_error_message(self, *, stop_reason: str) -> str | None:
         if stop_reason == "max_tokens":
             return (
@@ -876,6 +975,12 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
 
     def create_session(self) -> AgentSessionContext:
         return AnthropicMessagesChatContext(system_role=None)
+
+    def _make_tool_response_adapter(self) -> AnthropicMessagesToolResponseAdapter:
+        return AnthropicMessagesToolResponseAdapter(
+            max_tool_call_length=self._max_tool_call_length,
+            max_tool_call_lines=self._max_tool_call_lines,
+        )
 
     def make_agent_event_publisher(
         self,
@@ -969,9 +1074,9 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
 
         return messages
 
-    def _convert_messages(
+    def _compose_system_instructions(
         self, *, context: AgentSessionContext
-    ) -> tuple[list[dict], Optional[str]]:
+    ) -> Optional[str]:
         system_parts = [
             part
             for part in (
@@ -980,9 +1085,35 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
             )
             if isinstance(part, str) and part.strip() != ""
         ]
-        system = "\n\n".join(system_parts) if len(system_parts) > 0 else None
-        messages = self._convert_message_list(raw_messages=context.messages)
+        return "\n\n".join(system_parts) if len(system_parts) > 0 else None
+
+    def _convert_messages_from_raw(
+        self,
+        *,
+        context: AgentSessionContext,
+        raw_messages: list[dict[str, Any]],
+    ) -> tuple[list[dict], Optional[str]]:
+        system = self._compose_system_instructions(context=context)
+        messages = self._convert_message_list(raw_messages=raw_messages)
         return messages, system
+
+    def _convert_messages(
+        self, *, context: AgentSessionContext
+    ) -> tuple[list[dict], Optional[str]]:
+        return self._convert_messages_from_raw(
+            context=context,
+            raw_messages=context.messages,
+        )
+
+    @staticmethod
+    def _set_request_messages_and_system(
+        *, request: dict[str, Any], messages: list[dict], system: Optional[str]
+    ) -> None:
+        request["messages"] = messages
+        if system is None:
+            request.pop("system", None)
+            return
+        request["system"] = system
 
     @staticmethod
     def _strip_trailing_user_messages(*, messages: list[dict[str, Any]]) -> list[dict]:
@@ -1128,6 +1259,252 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
             "edits": normalized_edits,
         }
 
+    @staticmethod
+    def _request_serialized_char_count(*, request: dict[str, Any]) -> int:
+        serializable = {
+            key: request[key]
+            for key in (
+                "model",
+                "messages",
+                "system",
+                "tools",
+                "tool_choice",
+                "output_config",
+                "thinking",
+                "context_management",
+                "mcp_servers",
+            )
+            if key in request
+        }
+        return len(json.dumps(serializable, ensure_ascii=False))
+
+    def _should_preflight_input_budget(
+        self,
+        *,
+        context: AgentSessionContext,
+        model: str,
+        request_char_count: int,
+    ) -> bool:
+        if request_char_count >= _ANTHROPIC_LOCAL_COMPACTION_PREFLIGHT_CHAR_THRESHOLD:
+            return True
+
+        usable_limit = self._usable_input_token_limit(model=model)
+        if usable_limit is None:
+            return False
+
+        recent_input_tokens = _total_input_tokens_from_usage(
+            context.metadata.get("last_response_usage")
+        )
+        if recent_input_tokens <= 0:
+            return False
+
+        return recent_input_tokens >= min(self._compaction_threshold, usable_limit)
+
+    async def _count_request_input_tokens(self, *, client: Any, request: dict) -> int:
+        model = request.get("model")
+        messages = request.get("messages")
+        if not isinstance(model, str):
+            raise RoomException("anthropic request model must be a string")
+        if not isinstance(messages, list):
+            raise RoomException("anthropic request messages must be a list")
+
+        count_request: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+        }
+
+        for key in (
+            "system",
+            "thinking",
+            "tool_choice",
+            "tools",
+            "output_config",
+            "context_management",
+            "mcp_servers",
+            "betas",
+        ):
+            value = request.get(key)
+            if value is not None:
+                count_request[key] = value
+
+        extra_headers = request.get("extra_headers")
+        if isinstance(extra_headers, dict) and len(extra_headers) > 0:
+            count_request["extra_headers"] = extra_headers
+
+        api = self._messages_api(client=client, request=request)
+        response = await api.count_tokens(**count_request)
+        return int(response.input_tokens)
+
+    @staticmethod
+    def _is_prompt_too_long_error(*, error: Exception) -> bool:
+        return "prompt is too long" in str(error).lower()
+
+    @staticmethod
+    def _drop_oldest_context_chunk(
+        *, messages: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        start_index: int | None = None
+        for index, message in enumerate(messages):
+            role = message.get("role")
+            if role in {"user", "assistant"}:
+                start_index = index
+                break
+
+        if start_index is None:
+            return []
+
+        drop_count = 1
+        first_message = messages[start_index]
+        first_role = first_message.get("role")
+
+        if first_role == "user":
+            if (
+                start_index + 1 < len(messages)
+                and messages[start_index + 1].get("role") == "assistant"
+            ):
+                drop_count = 2
+                assistant_message = messages[start_index + 1]
+                if (
+                    _message_has_block_type(
+                        message=assistant_message,
+                        block_type="tool_use",
+                    )
+                    and start_index + 2 < len(messages)
+                    and messages[start_index + 2].get("role") == "user"
+                    and _message_has_block_type(
+                        message=messages[start_index + 2],
+                        block_type="tool_result",
+                    )
+                ):
+                    drop_count = 3
+        elif first_role == "assistant":
+            if (
+                _message_has_block_type(message=first_message, block_type="tool_use")
+                and start_index + 1 < len(messages)
+                and messages[start_index + 1].get("role") == "user"
+                and _message_has_block_type(
+                    message=messages[start_index + 1],
+                    block_type="tool_result",
+                )
+            ):
+                drop_count = 2
+
+        dropped = messages[start_index : start_index + drop_count]
+        del messages[start_index : start_index + drop_count]
+        return dropped
+
+    async def _locally_compact_request_to_fit(
+        self,
+        *,
+        context: AgentSessionContext,
+        client: Any,
+        request: dict[str, Any],
+        force: bool = False,
+    ) -> bool:
+        if self._context_management_mode != "auto":
+            return False
+
+        model = request.get("model")
+        if not isinstance(model, str):
+            return False
+
+        usable_limit = self._usable_input_token_limit(model=model)
+        if usable_limit is None or usable_limit <= 0:
+            return False
+
+        request_char_count = self._request_serialized_char_count(request=request)
+        if not force and not self._should_preflight_input_budget(
+            context=context,
+            model=model,
+            request_char_count=request_char_count,
+        ):
+            return False
+
+        approximate_char_limit = usable_limit * _ANTHROPIC_APPROX_CHARS_PER_TOKEN
+        working_messages = copy.deepcopy(context.messages)
+        before_tokens: int | None = None
+        input_tokens: int | None = None
+        dropped_message_count = 0
+
+        while True:
+            messages, system = self._convert_messages_from_raw(
+                context=context,
+                raw_messages=working_messages,
+            )
+            self._set_request_messages_and_system(
+                request=request,
+                messages=messages,
+                system=system,
+            )
+            request_char_count = self._request_serialized_char_count(request=request)
+
+            exceeds_limit = request_char_count > approximate_char_limit
+            if not exceeds_limit:
+                try:
+                    input_tokens = await self._count_request_input_tokens(
+                        client=client,
+                        request=request,
+                    )
+                    if before_tokens is None:
+                        before_tokens = input_tokens
+                    exceeds_limit = input_tokens > usable_limit
+                except APIStatusError as error:
+                    if not self._is_prompt_too_long_error(error=error):
+                        if not force:
+                            logger.warning(
+                                "unable to preflight anthropic token count",
+                                exc_info=error,
+                            )
+                            return False
+                        raise
+                    exceeds_limit = True
+                except Exception as error:
+                    if not force:
+                        logger.warning(
+                            "unable to preflight anthropic token count",
+                            exc_info=error,
+                        )
+                        return False
+                    raise
+
+            if not exceeds_limit:
+                break
+
+            dropped_messages = self._drop_oldest_context_chunk(
+                messages=working_messages
+            )
+            if len(dropped_messages) == 0:
+                if input_tokens is not None:
+                    raise RoomException(
+                        "Anthropic prompt is too long "
+                        f"({input_tokens} input tokens) and cannot be compacted further. "
+                        "Reduce attachments, tools, or instructions and retry."
+                    )
+                raise RoomException(
+                    "Anthropic prompt is too long and cannot be compacted further. "
+                    "Reduce attachments, tools, or instructions and retry."
+                )
+
+            dropped_message_count += len(dropped_messages)
+
+        if dropped_message_count == 0:
+            return False
+
+        context.messages.clear()
+        context.messages.extend(working_messages)
+        context.metadata["last_local_compaction"] = {
+            "model": model,
+            "dropped_messages": dropped_message_count,
+            "input_tokens_before": before_tokens,
+            "input_tokens_after": input_tokens,
+            "usable_input_token_limit": usable_limit,
+        }
+        logger.warning(
+            "locally compacted anthropic request by dropping %s messages",
+            dropped_message_count,
+        )
+        return True
+
     def _is_tool_schema_grammar_complexity_error(self, *, error: Exception) -> bool:
         message = str(error).lower()
         return (
@@ -1149,6 +1526,37 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
         context_management = response.get("context_management")
         if isinstance(context_management, dict):
             context.metadata["last_context_management"] = context_management
+
+    async def get_input_tokens(
+        self,
+        *,
+        context: AgentSessionContext,
+        model: str,
+        room: Optional[RoomClient] = None,
+        toolkits: Optional[list[Toolkit]] = None,
+        output_schema: Optional[dict] = None,
+    ) -> int:
+        del output_schema
+
+        if room is None:
+            raise RoomException("room is required to count Anthropic input tokens")
+
+        client = self.get_anthropic_client(room=room)
+        messages, system = self._convert_messages(context=context)
+        tool_bundle = MessagesToolBundle(
+            toolkits=toolkits or [],
+            tool_calling_state=self._tool_calling_state,
+        )
+        request: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+        }
+        if system is not None:
+            request["system"] = system
+        tools = tool_bundle.to_json()
+        if tools is not None:
+            request["tools"] = tools
+        return await self._count_request_input_tokens(client=client, request=request)
 
     async def _stream_message(
         self,
@@ -1254,7 +1662,7 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
 
         context.turn_count += 1
 
-        tool_adapter = AnthropicMessagesToolResponseAdapter()
+        tool_adapter = self._make_tool_response_adapter()
 
         client = self.get_anthropic_client(room=room)
 
@@ -1360,6 +1768,14 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
                 # remove None fields
                 request = {k: v for k, v in request.items() if v is not None}
 
+                if await self._locally_compact_request_to_fit(
+                    context=context,
+                    client=client,
+                    request=request,
+                ):
+                    context_messages_snapshot = copy.deepcopy(context.messages)
+                    context_metadata_snapshot = copy.deepcopy(context.metadata)
+
                 logger.info("requesting response from anthropic with model: %s", model)
 
                 try:
@@ -1377,6 +1793,16 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
                         )
                         response_dict = _as_jsonable(response)
                 except APIStatusError as e:
+                    if self._is_prompt_too_long_error(error=e):
+                        if await self._locally_compact_request_to_fit(
+                            context=context,
+                            client=client,
+                            request=request,
+                            force=True,
+                        ):
+                            context_messages_snapshot = copy.deepcopy(context.messages)
+                            context_metadata_snapshot = copy.deepcopy(context.metadata)
+                            continue
                     if (
                         self._tool_calling_state.mode == "adaptive"
                         and tool_bundle.uses_strict_tools()
