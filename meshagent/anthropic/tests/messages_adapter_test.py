@@ -259,10 +259,12 @@ class _FakeAdapter(AnthropicMessagesAdapter):
         self._idx = 0
         self.requests: list[dict] = []
 
-    async def _create_with_optional_headers(self, *, client, request):
+    async def _stream_message(self, *, client, request, event_handler):
+        del client
+        del event_handler
         if self._idx >= len(self._responses):
             raise AssertionError("unexpected extra request")
-        self.requests.append(request)
+        self.requests.append(copy.deepcopy(request))
         resp = self._responses[self._idx]
         self._idx += 1
         return resp
@@ -287,10 +289,11 @@ class _CountedFakeAdapter(_FakeAdapter):
             raise AssertionError("unexpected token count request")
         return self._input_token_counts.pop(0)
 
-    async def _create_with_optional_headers(self, *, client, request):
+    async def _stream_message(self, *, client, request, event_handler):
         if self._idx >= len(self._responses):
             raise AssertionError("unexpected extra request")
         del client
+        del event_handler
         self.requests.append(copy.deepcopy(request))
         resp = self._responses[self._idx]
         self._idx += 1
@@ -1189,8 +1192,9 @@ async def test_next_adaptive_mode_retries_with_loose_tools_after_grammar_error(
 
     requests: list[dict] = []
 
-    async def _fake_create_with_optional_headers(*, client, request):
+    async def _fake_stream_message(*, client, request, event_handler):
         del client
+        del event_handler
         requests.append(request)
         if len(requests) == 1:
             raise _FakeAPIStatusError(
@@ -1201,8 +1205,8 @@ async def test_next_adaptive_mode_retries_with_loose_tools_after_grammar_error(
 
     monkeypatch.setattr(
         adapter,
-        "_create_with_optional_headers",
-        _fake_create_with_optional_headers,
+        "_stream_message",
+        _fake_stream_message,
     )
 
     result = await adapter.next(
@@ -1242,8 +1246,9 @@ async def test_next_adaptive_mode_enables_strict_after_local_tool_validation_fai
         {"content": [{"type": "text", "text": "done"}]},
     ]
 
-    async def _fake_create_with_optional_headers(*, client, request):
+    async def _fake_stream_message(*, client, request, event_handler):
         del client
+        del event_handler
         requests.append(request)
         if len(responses) == 0:
             raise AssertionError("unexpected extra request")
@@ -1251,8 +1256,8 @@ async def test_next_adaptive_mode_enables_strict_after_local_tool_validation_fai
 
     monkeypatch.setattr(
         adapter,
-        "_create_with_optional_headers",
-        _fake_create_with_optional_headers,
+        "_stream_message",
+        _fake_stream_message,
     )
 
     result = await adapter.next(
@@ -2219,6 +2224,35 @@ async def test_next_stores_usage_for_streaming_response(monkeypatch) -> None:
         "input_tokens": 7.0,
         "output_tokens": 4.0,
     }
+
+
+@pytest.mark.asyncio
+async def test_next_streams_without_event_handler(monkeypatch) -> None:
+    adapter = AnthropicMessagesAdapter(client=object())
+    context = AgentSessionContext(system_role=None)
+    context.append_user_message("hello")
+    called: dict[str, Any] = {}
+
+    async def _fake_stream_message(*, client, request, event_handler):
+        del client
+        called["request"] = request
+        called["event_handler"] = event_handler
+        event_handler({"type": "message.delta"})
+        return {"content": [{"type": "text", "text": "ok"}]}
+
+    monkeypatch.setattr(adapter, "_stream_message", _fake_stream_message)
+
+    result = await adapter.next(
+        context=context,
+        room=_DummyRoom(),
+        toolkits=[],
+    )
+
+    assert result == "ok"
+    assert callable(called["event_handler"])
+    assert called["request"]["messages"] == [
+        {"role": "user", "content": [{"type": "text", "text": "hello"}]}
+    ]
 
 
 @pytest.mark.asyncio

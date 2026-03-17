@@ -1140,6 +1140,15 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
             request.pop("extra_headers", None)
             return await api.create(**request)
 
+    def _stream_with_optional_headers(self, *, client: Any, request: dict) -> Any:
+        api = self._messages_api(client=client, request=request)
+        try:
+            return api.stream(**request)
+        except TypeError:
+            request = dict(request)
+            request.pop("extra_headers", None)
+            return api.stream(**request)
+
     def _ensure_beta(self, *, request: dict[str, Any], beta: str) -> None:
         betas = request.get("betas")
         if betas is None:
@@ -1576,9 +1585,7 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
         message = await stream.get_final_message()
         ```
         """
-
-        api = self._messages_api(client=client, request=request)
-        stream_mgr = api.stream(**request)
+        stream_mgr = self._stream_with_optional_headers(client=client, request=request)
 
         async with stream_mgr as stream:
             async for event in stream:
@@ -1777,21 +1784,23 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
                     context_metadata_snapshot = copy.deepcopy(context.metadata)
 
                 logger.info("requesting response from anthropic with model: %s", model)
+                stream_event_handler = event_handler
+                if stream_event_handler is None:
+
+                    def _discard_event(_: dict) -> None:
+                        return None
 
                 try:
-                    if event_handler is not None:
-                        final_message = await self._stream_message(
-                            client=client,
-                            request=request,
-                            event_handler=event_handler,
-                        )
-                        response_dict = _as_jsonable(final_message)
-                    else:
-                        response = await self._create_with_optional_headers(
-                            client=client,
-                            request=request,
-                        )
-                        response_dict = _as_jsonable(response)
+                    final_message = await self._stream_message(
+                        client=client,
+                        request=request,
+                        event_handler=(
+                            stream_event_handler
+                            if stream_event_handler is not None
+                            else _discard_event
+                        ),
+                    )
+                    response_dict = _as_jsonable(final_message)
                 except APIStatusError as e:
                     if self._is_prompt_too_long_error(error=e):
                         if await self._locally_compact_request_to_fit(

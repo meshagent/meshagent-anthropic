@@ -113,9 +113,9 @@ class AnthropicOpenAIResponsesStreamAdapter(AnthropicMessagesAdapter):
             "usage": None,
         }
 
-        api = self._messages_api(client=client, request=request)
+        stream_mgr = self._stream_with_optional_headers(client=client, request=request)
 
-        async with api.stream(**request) as stream:
+        async with stream_mgr as stream:
             async for event in stream:
                 data = event.model_dump(
                     mode="json",
@@ -400,7 +400,6 @@ class AnthropicOpenAIResponsesStreamAdapter(AnthropicMessagesAdapter):
         on_behalf_of: Optional[RemoteParticipant] = None,
         options: Optional[dict] = None,
     ) -> Any:
-        # Keep the same behavior; only streaming shape changes.
         return await super().next(
             context=context,
             room=room,
