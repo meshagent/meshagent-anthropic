@@ -1,7 +1,10 @@
 import asyncio
 import copy
+import logging
 import pytest
 from typing import Any
+import httpx
+from anthropic import APIConnectionError, APIStatusError
 
 from meshagent.agents.messages import (
     AgentFileContentDelta,
@@ -54,6 +57,27 @@ class _DummyRoom:
 
     def log_nowait(self, **kwargs):
         del kwargs
+
+
+def _anthropic_request() -> httpx.Request:
+    return httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+
+
+def _anthropic_status_error(
+    *,
+    status_code: int,
+    message: str,
+    headers: dict[str, str] | None = None,
+) -> APIStatusError:
+    return APIStatusError(
+        message,
+        response=httpx.Response(
+            status_code,
+            headers=headers,
+            request=_anthropic_request(),
+        ),
+        body={"type": "error"},
+    )
 
 
 @pytest.mark.asyncio
@@ -2331,6 +2355,148 @@ async def test_next_accepts_options_keyword_argument() -> None:
     assert "reasoning" not in request
 
 
+@pytest.mark.asyncio
+async def test_next_retries_after_retryable_anthropic_status_error(
+    monkeypatch,
+    caplog,
+) -> None:
+    adapter = AnthropicMessagesAdapter(client=object(), max_retries=2)
+    context = AgentSessionContext(system_role=None)
+    context.append_user_message("hello")
+    requests: list[dict[str, Any]] = []
+    events: list[dict[str, Any]] = []
+    sleep_calls: list[float] = []
+
+    async def _fake_sleep(delay: float) -> None:
+        sleep_calls.append(delay)
+
+    async def _fake_stream_message(*, client, request, event_handler):
+        del client
+        del event_handler
+        requests.append(copy.deepcopy(request))
+        if len(requests) == 1:
+            raise _anthropic_status_error(
+                status_code=529,
+                message="overloaded",
+                headers={
+                    "request-id": "req_retry_123",
+                    "retry-after": "1.5",
+                },
+            )
+        return {"content": [{"type": "text", "text": "ok"}]}
+
+    monkeypatch.setattr(
+        "meshagent.anthropic.messages_adapter.asyncio.sleep",
+        _fake_sleep,
+    )
+    monkeypatch.setattr(adapter, "_stream_message", _fake_stream_message)
+
+    with caplog.at_level(logging.WARNING, logger="anthropic_agent"):
+        result = await adapter.next(
+            context=context,
+            room=_DummyRoom(),
+            toolkits=[],
+            event_handler=events.append,
+        )
+
+    assert result == "ok"
+    assert len(requests) == 2
+    assert requests[0]["messages"] == requests[1]["messages"]
+    assert sleep_calls == [1.5]
+    assert [
+        {
+            "type": event["type"],
+            "name": event["name"],
+            "state": event["state"],
+            "headline": event["headline"],
+        }
+        for event in events
+    ] == [
+        {
+            "type": "agent.event",
+            "name": "anthropic.retry",
+            "state": "in_progress",
+            "headline": "Retrying the LLM request (retry 1/2)",
+        },
+        {
+            "type": "agent.event",
+            "name": "anthropic.retry",
+            "state": "completed",
+            "headline": "LLM request retry succeeded",
+        },
+    ]
+    assert events[0]["details"] == [
+        "Retry 1 of 2 in 1.50s.",
+        "Last error: overloaded",
+    ]
+    assert events[1]["details"] == ["Recovered after 1 retry."]
+    assert "anthropic request failed, retrying (1/2) in 1.50s" in caplog.text
+    assert "request_id=req_retry_123" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_next_retries_after_anthropic_connection_error(
+    monkeypatch,
+) -> None:
+    adapter = AnthropicMessagesAdapter(client=object(), max_retries=2)
+    context = AgentSessionContext(system_role=None)
+    context.append_user_message("hello")
+    events: list[dict[str, Any]] = []
+    sleep_calls: list[float] = []
+    requests: list[dict[str, Any]] = []
+
+    async def _fake_sleep(delay: float) -> None:
+        sleep_calls.append(delay)
+
+    async def _fake_stream_message(*, client, request, event_handler):
+        del client
+        del event_handler
+        requests.append(copy.deepcopy(request))
+        if len(requests) == 1:
+            raise APIConnectionError(
+                message="Connection error.",
+                request=_anthropic_request(),
+            )
+        return {"content": [{"type": "text", "text": "ok"}]}
+
+    monkeypatch.setattr(
+        "meshagent.anthropic.messages_adapter.asyncio.sleep",
+        _fake_sleep,
+    )
+    monkeypatch.setattr(adapter, "_stream_message", _fake_stream_message)
+
+    result = await adapter.next(
+        context=context,
+        room=_DummyRoom(),
+        toolkits=[],
+        event_handler=events.append,
+    )
+
+    assert result == "ok"
+    assert len(requests) == 2
+    assert sleep_calls == [1.0]
+    assert [
+        {
+            "state": event["state"],
+            "headline": event["headline"],
+        }
+        for event in events
+    ] == [
+        {
+            "state": "in_progress",
+            "headline": "Reconnecting to the LLM (retry 1/2)",
+        },
+        {
+            "state": "completed",
+            "headline": "Reconnected to the LLM",
+        },
+    ]
+    assert events[0]["details"] == [
+        "Retry 1 of 2 in 1.00s.",
+        "Last error: Connection error.",
+    ]
+
+
 class _ToolItemStream:
     def __init__(self, *, items: list[object]):
         self._items = items
@@ -2551,6 +2717,21 @@ def test_make_agent_event_publisher_emits_native_anthropic_messages() -> None:
     assert isinstance(mcp_started, AgentToolCallStarted)
     assert mcp_started.toolkit == "deepwiki"
     assert mcp_started.tool == "search"
+
+
+def test_make_agent_event_publisher_forwards_custom_events() -> None:
+    adapter = AnthropicMessagesAdapter(client=object())
+    custom_events: list[dict[str, Any]] = []
+    publisher = adapter.make_agent_event_publisher(
+        turn_id="turn-1",
+        thread_id="thread-1",
+        callback=lambda _: None,
+        custom_event_callback=custom_events.append,
+    )
+
+    publisher({"type": "agent.event", "headline": "retrying"})
+
+    assert custom_events == [{"type": "agent.event", "headline": "retrying"}]
 
 
 def test_make_agent_event_publisher_preserves_native_text_delta_whitespace() -> None:

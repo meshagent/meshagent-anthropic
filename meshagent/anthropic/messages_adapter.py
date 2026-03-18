@@ -49,9 +49,18 @@ from meshagent.anthropic.usage import (
 from meshagent.tools.strict_schema import ensure_strict_json_schema
 
 try:
-    from anthropic import APIStatusError, transform_schema
+    from anthropic import (
+        APIConnectionError,
+        APIError,
+        APIStatusError,
+        APITimeoutError,
+        transform_schema,
+    )
 except Exception:  # pragma: no cover
+    APIConnectionError = Exception  # type: ignore
+    APIError = Exception  # type: ignore
     APIStatusError = Exception  # type: ignore
+    APITimeoutError = Exception  # type: ignore
     transform_schema = None  # type: ignore
 
 logger = logging.getLogger("anthropic_agent")
@@ -67,6 +76,9 @@ _ANTHROPIC_LOCAL_COMPACTION_SAFETY_MARGIN = 4_096
 _ANTHROPIC_LOCAL_COMPACTION_PREFLIGHT_CHAR_THRESHOLD = 200_000
 _ANTHROPIC_APPROX_CHARS_PER_TOKEN = 4
 _ANTHROPIC_STEERING_MARKER = "TURN INTERRUPTED"
+_ANTHROPIC_DEFAULT_MAX_RETRIES = 10
+_ANTHROPIC_DEFAULT_RETRY_BACKOFF_SECONDS = 1.0
+_ANTHROPIC_MAX_RETRY_BACKOFF_SECONDS = 30.0
 _ANTHROPIC_STEERING_INSTRUCTIONS = (
     "If the transcript contains an assistant message exactly equal to "
     f"'{_ANTHROPIC_STEERING_MARKER}', then treat the immediately following user "
@@ -870,6 +882,7 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
         self,
         model: str = os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-latest"),
         max_tokens: int | None = None,
+        max_retries: int = _ANTHROPIC_DEFAULT_MAX_RETRIES,
         client: Optional[Any] = None,
         message_options: Optional[dict] = None,
         provider: str = "anthropic",
@@ -889,6 +902,8 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
             raise ValueError(
                 "tool_calling_mode must be one of 'loose', 'strict', 'explicit', or 'adaptive'"
             )
+        if max_retries < 0:
+            raise ValueError("max_retries must be greater than or equal to 0")
         if compaction_threshold < 50000:
             raise ValueError(
                 "compaction_threshold must be greater than or equal to 50000"
@@ -910,6 +925,7 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
         self._compaction_instructions = compaction_instructions
         self._max_tool_call_length = max_tool_call_length
         self._max_tool_call_lines = max_tool_call_lines
+        self._max_retries = max_retries
         self._tool_calling_state = _AnthropicToolCallingState(mode=tool_calling_mode)
 
     def default_model(self) -> str:
@@ -987,11 +1003,13 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
         turn_id: str,
         thread_id: str,
         callback: Callable[[AgentMessage], None],
+        custom_event_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> Callable[[dict[str, Any]], None]:
         return make_anthropic_agent_event_publisher(
             turn_id=turn_id,
             thread_id=thread_id,
             callback=callback,
+            custom_event_callback=custom_event_callback,
         )
 
     def _set_function_tool_name_resolver(
@@ -1008,6 +1026,190 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
             return self._client
         http_client = get_logging_httpx_client() if self._log_requests else None
         return get_client(room=room, http_client=http_client)
+
+    def _is_retryable_anthropic_error(self, *, error: APIError) -> bool:
+        if isinstance(error, APIStatusError):
+            return (
+                error.status_code == 408
+                or error.status_code == 409
+                or error.status_code == 429
+                or error.status_code >= 500
+            )
+        return True
+
+    @staticmethod
+    def _session_metadata_string(
+        *,
+        context: AgentSessionContext,
+        key: str,
+    ) -> str | None:
+        value = context.metadata.get(key)
+        if not isinstance(value, str):
+            return None
+        normalized = value.strip()
+        return normalized if normalized != "" else None
+
+    def _retry_correlation_key(self, *, context: AgentSessionContext) -> str:
+        turn_id = self._session_metadata_string(context=context, key="turn_id")
+        if turn_id is None:
+            return "llm.retry"
+        return f"llm.retry:{turn_id}"
+
+    @staticmethod
+    def _is_reconnect_error(*, error: Exception) -> bool:
+        return isinstance(error, (APIConnectionError, APITimeoutError))
+
+    def _retry_headline(
+        self,
+        *,
+        error: Exception,
+        retry_number: int,
+        state: Literal["in_progress", "completed", "failed"],
+    ) -> str:
+        is_reconnect = self._is_reconnect_error(error=error)
+        if state == "in_progress":
+            if is_reconnect:
+                return (
+                    "Reconnecting to the LLM "
+                    f"(retry {retry_number}/{self._max_retries})"
+                )
+            return (
+                f"Retrying the LLM request (retry {retry_number}/{self._max_retries})"
+            )
+
+        if state == "completed":
+            if is_reconnect:
+                return "Reconnected to the LLM"
+            return "LLM request retry succeeded"
+
+        if is_reconnect:
+            return "Unable to reconnect to the LLM"
+        return "LLM request retry failed"
+
+    def _retry_detail_lines(
+        self,
+        *,
+        error: Exception,
+        retry_number: int,
+        state: Literal["in_progress", "completed", "failed"],
+        delay_seconds: float | None = None,
+    ) -> list[str]:
+        if state == "completed":
+            if retry_number == 1:
+                return ["Recovered after 1 retry."]
+            return [f"Recovered after {retry_number} retries."]
+
+        detail_lines: list[str] = []
+        if state == "in_progress" and delay_seconds is not None:
+            detail_lines.append(
+                f"Retry {retry_number} of {self._max_retries} in {delay_seconds:.2f}s."
+            )
+        if state == "failed":
+            detail_lines.append(
+                f"Retry budget exhausted after {retry_number} attempts."
+            )
+
+        error_message = str(error).strip()
+        if error_message != "":
+            detail_lines.append(f"Last error: {error_message}")
+        return detail_lines
+
+    def _emit_retry_event(
+        self,
+        *,
+        context: AgentSessionContext,
+        event_handler: Callable[[dict[str, Any]], None] | None,
+        error: Exception,
+        retry_number: int,
+        state: Literal["in_progress", "completed", "failed"],
+        delay_seconds: float | None = None,
+    ) -> None:
+        if event_handler is None:
+            return
+
+        headline = self._retry_headline(
+            error=error,
+            retry_number=retry_number,
+            state=state,
+        )
+        event: dict[str, Any] = {
+            "type": "agent.event",
+            "source": self._provider,
+            "name": "anthropic.retry",
+            "kind": "message",
+            "state": state,
+            "method": "anthropic.retry",
+            "summary": headline,
+            "headline": headline,
+            "details": self._retry_detail_lines(
+                error=error,
+                retry_number=retry_number,
+                state=state,
+                delay_seconds=delay_seconds,
+            ),
+            "correlation_key": self._retry_correlation_key(context=context),
+            "append_details": True,
+        }
+        turn_id = self._session_metadata_string(context=context, key="turn_id")
+        if turn_id is not None:
+            event["turn_id"] = turn_id
+        event_handler(event)
+
+    def _retry_delay_seconds(self, *, retry_number: int, error: Exception) -> float:
+        if isinstance(error, APIStatusError):
+            retry_after = error.response.headers.get("retry-after")
+            if retry_after is not None:
+                normalized_retry_after = retry_after.strip()
+                if normalized_retry_after != "":
+                    try:
+                        retry_after_seconds = float(normalized_retry_after)
+                        if retry_after_seconds > 0:
+                            return min(
+                                retry_after_seconds,
+                                _ANTHROPIC_MAX_RETRY_BACKOFF_SECONDS,
+                            )
+                    except ValueError:
+                        pass
+
+        return min(
+            _ANTHROPIC_DEFAULT_RETRY_BACKOFF_SECONDS * (2 ** (retry_number - 1)),
+            _ANTHROPIC_MAX_RETRY_BACKOFF_SECONDS,
+        )
+
+    def _log_retry(
+        self,
+        *,
+        error: Exception,
+        retry_number: int,
+        delay_seconds: float,
+    ) -> None:
+        log_message = "anthropic request failed, retrying"
+        if self._is_reconnect_error(error=error):
+            log_message = "anthropic connection failed, retrying"
+
+        request_id = None
+        if isinstance(error, APIStatusError):
+            request_id = error.request_id
+
+        if request_id:
+            logger.warning(
+                "%s (%s/%s) in %.2fs (request_id=%s): %s",
+                log_message,
+                retry_number,
+                self._max_retries,
+                delay_seconds,
+                request_id,
+                error,
+            )
+        else:
+            logger.warning(
+                "%s (%s/%s) in %.2fs: %s",
+                log_message,
+                retry_number,
+                self._max_retries,
+                delay_seconds,
+                error,
+            )
 
     @staticmethod
     def _message_to_blocks(*, role: str, content: Any) -> dict:
@@ -1678,6 +1880,9 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
         context_messages_snapshot = copy.deepcopy(context.messages)
         context_metadata_snapshot = copy.deepcopy(context.metadata)
         iteration_committed = False
+        stream_retry_number = 0
+        pending_retry_completion_number: int | None = None
+        pending_retry_error: Exception | None = None
 
         try:
 
@@ -1696,6 +1901,12 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
                     self.on_turn_steer(context=context, interrupted=False)
                     context.messages.extend(trailing_messages)
                 return steered
+
+            def restore_context_snapshot() -> None:
+                context.messages.clear()
+                context.messages.extend(copy.deepcopy(context_messages_snapshot))
+                context.metadata.clear()
+                context.metadata.update(copy.deepcopy(context_metadata_snapshot))
 
             while True:
                 context_messages_snapshot = copy.deepcopy(context.messages)
@@ -1790,39 +2001,119 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
                     def _discard_event(_: dict) -> None:
                         return None
 
-                try:
-                    final_message = await self._stream_message(
-                        client=client,
-                        request=request,
-                        event_handler=(
-                            stream_event_handler
-                            if stream_event_handler is not None
-                            else _discard_event
-                        ),
-                    )
-                    response_dict = _as_jsonable(final_message)
-                except APIStatusError as e:
-                    if self._is_prompt_too_long_error(error=e):
-                        if await self._locally_compact_request_to_fit(
-                            context=context,
+                retry_request = False
+                while True:
+                    try:
+                        final_message = await self._stream_message(
                             client=client,
                             request=request,
-                            force=True,
-                        ):
-                            context_messages_snapshot = copy.deepcopy(context.messages)
-                            context_metadata_snapshot = copy.deepcopy(context.metadata)
-                            continue
-                    if (
-                        self._tool_calling_state.mode == "adaptive"
-                        and tool_bundle.uses_strict_tools()
-                        and self._is_tool_schema_grammar_complexity_error(error=e)
-                    ):
-                        logger.warning(
-                            "anthropic strict tool grammar is too large; disabling strict tool calling and retrying"
+                            event_handler=(
+                                stream_event_handler
+                                if stream_event_handler is not None
+                                else _discard_event
+                            ),
                         )
-                        tool_bundle.disable_all_strict()
-                        continue
-                    raise
+                        if pending_retry_completion_number is not None:
+                            self._emit_retry_event(
+                                context=context,
+                                event_handler=event_handler,
+                                error=(
+                                    pending_retry_error
+                                    if pending_retry_error is not None
+                                    else RoomException(
+                                        "Anthropic request retry recovered"
+                                    )
+                                ),
+                                retry_number=pending_retry_completion_number,
+                                state="completed",
+                            )
+                            pending_retry_completion_number = None
+                            pending_retry_error = None
+                        stream_retry_number = 0
+                        response_dict = _as_jsonable(final_message)
+                        break
+                    except APIStatusError as error:
+                        if self._is_prompt_too_long_error(error=error):
+                            if await self._locally_compact_request_to_fit(
+                                context=context,
+                                client=client,
+                                request=request,
+                                force=True,
+                            ):
+                                context_messages_snapshot = copy.deepcopy(
+                                    context.messages
+                                )
+                                context_metadata_snapshot = copy.deepcopy(
+                                    context.metadata
+                                )
+                                retry_request = True
+                                break
+                        if (
+                            self._tool_calling_state.mode == "adaptive"
+                            and tool_bundle.uses_strict_tools()
+                            and self._is_tool_schema_grammar_complexity_error(
+                                error=error
+                            )
+                        ):
+                            logger.warning(
+                                "anthropic strict tool grammar is too large; disabling strict tool calling and retrying"
+                            )
+                            tool_bundle.disable_all_strict()
+                            restore_context_snapshot()
+                            retry_request = True
+                            break
+                        anthropic_error: APIError = error
+                    except APIError as error:
+                        anthropic_error = error
+
+                    if not self._is_retryable_anthropic_error(error=anthropic_error):
+                        if stream_retry_number > 0:
+                            self._emit_retry_event(
+                                context=context,
+                                event_handler=event_handler,
+                                error=anthropic_error,
+                                retry_number=stream_retry_number,
+                                state="failed",
+                            )
+                        raise anthropic_error
+
+                    if stream_retry_number >= self._max_retries:
+                        if stream_retry_number > 0:
+                            self._emit_retry_event(
+                                context=context,
+                                event_handler=event_handler,
+                                error=anthropic_error,
+                                retry_number=stream_retry_number,
+                                state="failed",
+                            )
+                        raise anthropic_error
+
+                    stream_retry_number += 1
+                    delay_seconds = self._retry_delay_seconds(
+                        retry_number=stream_retry_number,
+                        error=anthropic_error,
+                    )
+                    self._log_retry(
+                        error=anthropic_error,
+                        retry_number=stream_retry_number,
+                        delay_seconds=delay_seconds,
+                    )
+                    self._emit_retry_event(
+                        context=context,
+                        event_handler=event_handler,
+                        error=anthropic_error,
+                        retry_number=stream_retry_number,
+                        state="in_progress",
+                        delay_seconds=delay_seconds,
+                    )
+
+                    restore_context_snapshot()
+                    pending_retry_completion_number = stream_retry_number
+                    pending_retry_error = anthropic_error
+                    await asyncio.sleep(delay_seconds)
+
+                if retry_request:
+                    continue
 
                 self._store_usage(context=context, response=response_dict, model=model)
 
@@ -2112,12 +2403,11 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
 
         except asyncio.CancelledError:
             if not iteration_committed:
-                context.messages.clear()
-                context.messages.extend(copy.deepcopy(context_messages_snapshot))
-                context.metadata.clear()
-                context.metadata.update(copy.deepcopy(context_metadata_snapshot))
+                restore_context_snapshot()
             raise
         except APIStatusError as e:
+            raise RoomException(f"Error from Anthropic: {e}")
+        except APIError as e:
             raise RoomException(f"Error from Anthropic: {e}")
         finally:
             self._set_function_tool_name_resolver(
