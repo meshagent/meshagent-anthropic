@@ -119,6 +119,21 @@ class _AnyArgsTool(FunctionTool):
         return {"ok": True, "args": kwargs}
 
 
+class _CallerContextTool(FunctionTool):
+    def __init__(self, name: str):
+        super().__init__(
+            name=name,
+            input_schema={"type": "object", "additionalProperties": True},
+            description="caller context test tool",
+        )
+        self.caller_contexts: list[dict[str, Any] | None] = []
+
+    async def execute(self, context: ToolContext, **kwargs):
+        del kwargs
+        self.caller_contexts.append(context.caller_context)
+        return {"ok": True}
+
+
 class _StrictOptOutTool(FunctionTool):
     def __init__(self, name: str):
         super().__init__(
@@ -598,6 +613,46 @@ async def test_next_batches_multiple_tool_results_into_single_user_message():
         "toolu_1",
         "toolu_2",
     }
+
+
+@pytest.mark.asyncio
+async def test_next_passes_thread_and_turn_ids_in_tool_caller_context():
+    tool = _CallerContextTool("context_tool")
+    responses = [
+        {
+            "content": [
+                {"type": "text", "text": "calling tool"},
+                {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "context_tool",
+                    "input": {},
+                },
+            ]
+        },
+        {"content": [{"type": "text", "text": "done"}]},
+    ]
+
+    adapter = _FakeAdapter(responses=responses)
+    ctx = AgentSessionContext(system_role=None)
+    ctx.append_user_message("run tool")
+    ctx.metadata["thread_id"] = "thread-1"
+    ctx.metadata["turn_id"] = "turn-1"
+
+    result = await adapter.next(
+        context=ctx,
+        room=_DummyRoom(),
+        toolkits=[Toolkit(name="test", tools=[tool])],
+    )
+
+    assert result == "done"
+    assert len(tool.caller_contexts) == 1
+    caller_context = tool.caller_contexts[0]
+    assert isinstance(caller_context, dict)
+    assert caller_context["thread_id"] == "thread-1"
+    assert caller_context["turn_id"] == "turn-1"
+    assert caller_context["item_id"] == "toolu_1"
+    assert isinstance(caller_context.get("chat"), dict)
 
 
 def test_make_agent_event_publisher_emits_tool_log_delta() -> None:
