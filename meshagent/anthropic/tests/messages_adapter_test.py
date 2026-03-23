@@ -34,6 +34,7 @@ from meshagent.anthropic.messages_adapter import (
     _consume_streaming_tool_result,
     safe_tool_name,
 )
+from meshagent.anthropic.web_fetch import WebFetchTool
 from meshagent.agents.agent import AgentSessionContext
 from meshagent.api.messaging import FileContent, JsonContent, TextContent
 from meshagent.tools import FunctionTool, Toolkit, ToolContext
@@ -2223,6 +2224,34 @@ async def test_next_uses_context_management_beta_for_non_compaction_edits() -> N
     assert len(adapter.requests) == 1
     request = adapter.requests[0]
     assert "context-management-2025-06-27" in request["betas"]
+
+
+@pytest.mark.asyncio
+async def test_next_merges_header_betas_into_request_betas_for_web_fetch_compaction() -> (
+    None
+):
+    adapter = _FakeAdapter(
+        responses=[{"content": [{"type": "text", "text": "ok"}]}],
+        model="claude-opus-4-6",
+        context_management="auto",
+    )
+    context = AgentSessionContext(system_role=None)
+    context.append_user_message("hello")
+
+    result = await adapter.next(
+        context=context,
+        room=_DummyRoom(),
+        toolkits=[Toolkit(name="web_fetch", tools=[WebFetchTool()])],
+    )
+
+    assert result == "ok"
+    assert len(adapter.requests) == 1
+    request = adapter.requests[0]
+    assert "compact-2026-01-12" in request["betas"]
+    assert "web-fetch-2025-09-10" in request["betas"]
+    extra_headers = request.get("extra_headers")
+    if isinstance(extra_headers, dict):
+        assert "anthropic-beta" not in extra_headers
 
 
 @pytest.mark.asyncio

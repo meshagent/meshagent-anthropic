@@ -41,6 +41,7 @@ from urllib.parse import urlparse
 
 from meshagent.anthropic.proxy import get_client, get_logging_httpx_client
 from meshagent.anthropic.mcp import MCPTool as MCPConnectorTool
+from meshagent.anthropic.request_tool import AnthropicRequestTool
 from meshagent.anthropic.usage import (
     add_usage_metrics,
     normalize_anthropic_usage,
@@ -1387,6 +1388,42 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
             return
         self._ensure_beta(request=request, beta=_CONTEXT_MANAGEMENT_BETA)
 
+    @staticmethod
+    def _normalized_beta_values(*, value: Any) -> list[str]:
+        if isinstance(value, str):
+            return [beta.strip() for beta in value.split(",") if beta.strip() != ""]
+        if isinstance(value, list):
+            normalized = list[str]()
+            for beta in value:
+                text = str(beta).strip()
+                if text != "":
+                    normalized.append(text)
+            return normalized
+        return []
+
+    def _normalize_request_betas(self, *, request: dict[str, Any]) -> None:
+        extra_headers = request.get("extra_headers")
+        if not isinstance(extra_headers, dict):
+            return
+
+        header_value = extra_headers.pop(AnthropicRequestTool.beta_header, None)
+        header_betas = self._normalized_beta_values(value=header_value)
+        request_betas = self._normalized_beta_values(value=request.get("betas"))
+
+        merged_betas = list[str]()
+        seen_betas = set[str]()
+        for beta in [*request_betas, *header_betas]:
+            if beta in seen_betas:
+                continue
+            seen_betas.add(beta)
+            merged_betas.append(beta)
+
+        if len(merged_betas) > 0:
+            request["betas"] = merged_betas
+
+        if len(extra_headers) == 0:
+            request["extra_headers"] = None
+
     def _build_compaction_edit(self) -> dict[str, Any]:
         edit: dict[str, Any] = {
             "type": "compact_20260112",
@@ -1965,6 +2002,7 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
                 )
                 self._add_auto_compaction_context_management(request=request)
                 self._ensure_context_management_betas(request=request)
+                self._normalize_request_betas(request=request)
 
                 # Normalize empty lists to None for Anthropic.
                 if (
