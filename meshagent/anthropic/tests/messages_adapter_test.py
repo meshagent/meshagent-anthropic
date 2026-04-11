@@ -89,7 +89,6 @@ async def test_anthropic_tool_response_adapter_truncates_text_output() -> None:
     )
 
     output = await adapter.to_plain_text(
-        room=_DummyRoom(),
         response=TextContent(text="line1\nline2\nline3\nline4"),
     )
 
@@ -106,7 +105,6 @@ async def test_anthropic_tool_response_adapter_truncates_text_file_output() -> N
     )
 
     output = await adapter.to_plain_text(
-        room=_DummyRoom(),
         response=FileContent(
             data=b"line1\nline2\nline3\nline4",
             name="notes.txt",
@@ -130,6 +128,54 @@ def test_anthropic_adapter_passes_through_tool_truncation_limits() -> None:
 
     assert tool_adapter.max_tool_call_length == 222
     assert tool_adapter.max_tool_call_lines == 11
+
+
+@pytest.mark.asyncio
+async def test_get_input_tokens_does_not_require_room() -> None:
+    adapter = _CountedFakeAdapter(responses=[], input_token_counts=[17])
+    context = AgentSessionContext(system_role=None)
+    context.append_user_message("hello")
+
+    input_tokens = await adapter.get_input_tokens(
+        context=context,
+        model="claude-sonnet-4-20250514",
+    )
+
+    assert input_tokens == 17
+    assert len(adapter.count_requests) == 1
+    assert adapter.count_requests[0]["model"] == "claude-sonnet-4-20250514"
+
+
+def test_anthropic_adapter_passes_base_url_to_get_client(monkeypatch) -> None:
+    adapter = AnthropicMessagesAdapter(base_url="https://anthropic.example.test")
+    fake_client = object()
+    call_args: dict[str, object] = {}
+
+    def _fake_get_client(*, base_url=None, http_client=None, api_key=None):
+        call_args["base_url"] = base_url
+        call_args["http_client"] = http_client
+        call_args["api_key"] = api_key
+        return fake_client
+
+    monkeypatch.setattr(
+        "meshagent.anthropic.messages_adapter.get_client",
+        _fake_get_client,
+    )
+
+    client = adapter.get_anthropic_client()
+
+    assert client is fake_client
+    assert call_args["base_url"] == "https://anthropic.example.test"
+    assert call_args["http_client"] is None
+    assert call_args["api_key"] is None
+
+
+def test_anthropic_adapter_reads_base_url_from_environment(monkeypatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://env.anthropic.example.test")
+
+    adapter = AnthropicMessagesAdapter(client=object())
+
+    assert adapter._base_url == "https://env.anthropic.example.test"
 
 
 class _AnyArgsTool(FunctionTool):
@@ -809,7 +855,7 @@ def test_messages_tool_bundle_transforms_unsupported_numeric_constraints() -> No
 
 
 @pytest.mark.asyncio
-async def test_messages_tool_bundle_execute_respects_context_validation_mode():
+async def test_messages_tool_bundle_execute_respects_explicit_validation_mode():
     toolkit = Toolkit(name="test", tools=[_BoundedExecutionTool("tool_a")])
     tool_bundle = MessagesToolBundle(toolkits=[toolkit])
 
@@ -817,9 +863,9 @@ async def test_messages_tool_bundle_execute_respects_context_validation_mode():
         context=ToolContext(
             room=_DummyRoom(),
             caller=_DummyParticipant(),
-            validation_mode="content_types",
         ),
         tool_use={"name": "tool_a", "id": "toolu_1", "input": {"count": 9}},
+        validation_mode="content_types",
     )
 
     assert isinstance(result, JsonContent)
@@ -1540,14 +1586,12 @@ async def test_next_inserts_steering_before_trailing_tool_messages(
         *,
         context,
         tool_call,
-        room,
         response,
     ):
         messages = await original_create_messages(
             self,
             context=context,
             tool_call=tool_call,
-            room=room,
             response=response,
         )
         return [

@@ -22,6 +22,8 @@ adapter = AnthropicMessagesAdapter(
 )
 ```
 
+You can also pass `base_url=` to `AnthropicMessagesAdapter`. If omitted, MeshAgent reads `ANTHROPIC_BASE_URL` from the environment when constructing the provider client.
+
 ### Tool Response Adapter
 `AnthropicMessagesToolResponseAdapter` converts a tool's structured response into Anthropic `tool_result` blocks that can be inserted back into the conversation.
 

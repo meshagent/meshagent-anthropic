@@ -1,4 +1,5 @@
 ## [0.36.3]
+- Breaking: `AnthropicMessagesAdapter` now takes `base_url` in the constructor, defaults it from `ANTHROPIC_BASE_URL`, and no longer derives provider clients from a `RoomClient`; `meshagent.anthropic.proxy.get_client` also dropped its `room` parameter.
 - Storage client now supports move operations and emits `file.moved` events.
 - Secrets client now supports existence checks.
 - Project user add calls now omit permission fields unless explicitly set.

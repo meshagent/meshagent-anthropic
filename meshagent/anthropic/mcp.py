@@ -97,5 +97,6 @@ class MCPToolkitBuilder(ToolkitBuilder):
     def __init__(self):
         super().__init__(name="mcp", type=MCPConfig)
 
-    async def make(self, *, room, model: str, config: MCPConfig) -> Toolkit:
+    async def make(self, *, model: str, config: MCPConfig) -> Toolkit:
+        del model
         return Toolkit(name="mcp", tools=[MCPTool(config=config)])

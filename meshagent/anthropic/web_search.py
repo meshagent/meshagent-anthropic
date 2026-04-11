@@ -69,5 +69,6 @@ class WebSearchToolkitBuilder(ToolkitBuilder):
     def __init__(self):
         super().__init__(name="web_search", type=WebSearchConfig)
 
-    async def make(self, *, room, model: str, config: WebSearchConfig) -> Toolkit:
+    async def make(self, *, model: str, config: WebSearchConfig) -> Toolkit:
+        del model
         return Toolkit(name="web_search", tools=[WebSearchTool(config=config)])

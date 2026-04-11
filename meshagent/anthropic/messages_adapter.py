@@ -8,6 +8,7 @@ from meshagent.agents.event_publisher import (
 )
 from meshagent.agents.messages import AgentMessage
 from meshagent.tools import Toolkit, ToolContext, FunctionTool, BaseTool
+from meshagent.tools.tool import ValidationMode
 from meshagent.api.messaging import (
     Content,
     LinkContent,
@@ -702,7 +703,7 @@ class MessagesToolBundle:
     def disable_all_strict(self) -> None:
         self._tool_calling_state.disable_all_strict()
 
-    def validation_mode_for_tool_use(self, *, tool_use: dict) -> str | None:
+    def validation_mode_for_tool_use(self, *, tool_use: dict) -> ValidationMode | None:
         safe_name = tool_use.get("name")
         if not isinstance(safe_name, str):
             return None
@@ -711,7 +712,11 @@ class MessagesToolBundle:
         return None
 
     async def execute(
-        self, *, context: ToolContext, tool_use: dict
+        self,
+        *,
+        context: ToolContext,
+        tool_use: dict,
+        validation_mode: ValidationMode | None = None,
     ) -> Content | AsyncIterable[Any]:
         safe_name = tool_use.get("name")
         if safe_name not in self._safe_names:
@@ -729,6 +734,7 @@ class MessagesToolBundle:
             context=context,
             name=name,
             input=JsonContent(json=arguments),
+            validation_mode="full" if validation_mode is None else validation_mode,
         )
         return result
 
@@ -745,19 +751,16 @@ class AnthropicMessagesToolResponseAdapter(ToolResponseAdapter):
             max_tool_call_lines=max_tool_call_lines,
         )
 
-    async def to_plain_text(self, *, room: RoomClient, response: Content) -> str:
-        text_file = await self.file_content_to_text_content(
-            room=room,
-            content=response,
-        )
+    async def to_plain_text(self, *, response: Content) -> str:
+        text_file = await self.file_content_to_text_content(content=response)
         if text_file is not None:
             if isinstance(response, FileContent) and _is_html_mime_type(
                 response.mime_type
             ):
                 text_file = TextContent(text=convert(text_file.text))
-            response = self.truncate(room=room, content=text_file)
+            response = self.truncate(content=text_file)
         else:
-            response = self.truncate(room=room, content=response)
+            response = self.truncate(content=response)
         if isinstance(response, LinkContent):
             return json.dumps({"name": response.name, "url": response.url})
         if isinstance(response, JsonContent):
@@ -781,9 +784,9 @@ class AnthropicMessagesToolResponseAdapter(ToolResponseAdapter):
         *,
         context: AgentSessionContext,
         tool_call: Any,
-        room: RoomClient,
         response: Content,
     ) -> list:
+        del context
         tool_use = tool_call if isinstance(tool_call, dict) else _as_jsonable(tool_call)
         tool_use_id = tool_use.get("id")
         if tool_use_id is None:
@@ -797,10 +800,7 @@ class AnthropicMessagesToolResponseAdapter(ToolResponseAdapter):
         try:
             if isinstance(response, FileContent):
                 mime_type = (response.mime_type or "").lower()
-                text_file = await self.file_content_to_text_content(
-                    room=room,
-                    content=response,
-                )
+                text_file = await self.file_content_to_text_content(content=response)
 
                 if mime_type == "image/jpg":
                     mime_type = "image/jpeg"
@@ -808,7 +808,7 @@ class AnthropicMessagesToolResponseAdapter(ToolResponseAdapter):
                 if text_file is not None:
                     if _is_html_mime_type(mime_type):
                         text_file = TextContent(text=convert(text_file.text))
-                    output = await self.to_plain_text(room=room, response=text_file)
+                    output = await self.to_plain_text(response=text_file)
                     tool_result_content = [_text_block(output)]
                 elif mime_type.startswith("image/"):
                     allowed = {"image/jpeg", "image/png", "image/gif", "image/webp"}
@@ -843,11 +843,11 @@ class AnthropicMessagesToolResponseAdapter(ToolResponseAdapter):
                     ]
 
                 else:
-                    output = await self.to_plain_text(room=room, response=response)
+                    output = await self.to_plain_text(response=response)
                     tool_result_content = [_text_block(output)]
 
             else:
-                output = await self.to_plain_text(room=room, response=response)
+                output = await self.to_plain_text(response=response)
                 tool_result_content = [_text_block(output)]
 
         except Exception as ex:
@@ -864,16 +864,6 @@ class AnthropicMessagesToolResponseAdapter(ToolResponseAdapter):
                 }
             ],
         }
-
-        room.developer.log_nowait(
-            type="llm.message",
-            data={
-                "context": context.id,
-                "participant_id": room.local_participant.id,
-                "participant_name": room.local_participant.get_attribute("name"),
-                "message": message,
-            },
-        )
 
         return [message]
 
@@ -894,6 +884,7 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
         compaction_instructions: Optional[str] = None,
         tool_calling_mode: ToolCallingMode = "adaptive",
         *,
+        base_url: str | None = None,
         max_tool_call_length: int = DEFAULT_MAX_TOOL_CALL_LENGTH,
         max_tool_call_lines: int = DEFAULT_MAX_TOOL_CALL_LINES,
     ):
@@ -917,6 +908,11 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
             else max_tokens
         )
         self._client = client
+        if base_url is None:
+            base_url = os.getenv("ANTHROPIC_BASE_URL")
+        if base_url is not None:
+            base_url = base_url.strip() or None
+        self._base_url = base_url
         self._message_options = message_options or {}
         self._provider = provider
         self._log_requests = log_requests
@@ -1022,11 +1018,11 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
         if isinstance(event_handler, _AnthropicAgentEventPublisher):
             event_handler.set_function_tool_name_resolver(resolver)
 
-    def get_anthropic_client(self, *, room: RoomClient) -> Any:
+    def get_anthropic_client(self) -> Any:
         if self._client is not None:
             return self._client
         http_client = get_logging_httpx_client() if self._log_requests else None
-        return get_client(room=room, http_client=http_client)
+        return get_client(base_url=self._base_url, http_client=http_client)
 
     def _is_retryable_anthropic_error(self, *, error: APIError) -> bool:
         if isinstance(error, APIStatusError):
@@ -1780,16 +1776,12 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
         *,
         context: AgentSessionContext,
         model: str,
-        room: Optional[RoomClient] = None,
         toolkits: Optional[list[Toolkit]] = None,
         output_schema: Optional[dict] = None,
     ) -> int:
         del output_schema
 
-        if room is None:
-            raise RoomException("room is required to count Anthropic input tokens")
-
-        client = self.get_anthropic_client(room=room)
+        client = self.get_anthropic_client()
         messages, system = self._convert_messages(context=context)
         tool_bundle = MessagesToolBundle(
             toolkits=toolkits or [],
@@ -1910,7 +1902,7 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
 
         tool_adapter = self._make_tool_response_adapter()
 
-        client = self.get_anthropic_client(room=room)
+        client = self.get_anthropic_client()
 
         validation_attempts = 0
         pause_turn_continuations = 0
@@ -2210,9 +2202,6 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
                             on_behalf_of=on_behalf_of,
                             caller_context=caller_context,
                             event_handler=event_handler,
-                            validation_mode=tool_bundle.validation_mode_for_tool_use(
-                                tool_use=tool_use
-                            ),
                         )
                         try:
                             if event_handler is not None:
@@ -2233,6 +2222,9 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
                             tool_response = await tool_bundle.execute(
                                 context=tool_context,
                                 tool_use=tool_use,
+                                validation_mode=tool_bundle.validation_mode_for_tool_use(
+                                    tool_use=tool_use
+                                ),
                             )
                             if isinstance(tool_response, AsyncIterable):
                                 tool_response = await _consume_streaming_tool_result(
@@ -2257,7 +2249,6 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
                             return await tool_adapter.create_messages(
                                 context=context,
                                 tool_call=tool_use,
-                                room=room,
                                 response=tool_response,
                             )
                         except asyncio.CancelledError:

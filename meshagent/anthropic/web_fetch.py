@@ -69,5 +69,6 @@ class WebFetchToolkitBuilder(ToolkitBuilder):
     def __init__(self):
         super().__init__(name="web_fetch", type=WebFetchConfig)
 
-    async def make(self, *, room, model: str, config: WebFetchConfig) -> Toolkit:
+    async def make(self, *, model: str, config: WebFetchConfig) -> Toolkit:
+        del model
         return Toolkit(name="web_fetch", tools=[WebFetchTool(config=config)])

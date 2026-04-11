@@ -1,7 +1,7 @@
-from meshagent.api import RoomClient
 import logging
 import json
 import httpx
+import os
 from typing import Optional, Any
 
 try:
@@ -57,34 +57,24 @@ def get_logging_httpx_client() -> httpx.AsyncClient:
 
 
 def get_client(
-    *, room: RoomClient, http_client: Optional[httpx.AsyncClient] = None
+    *,
+    base_url: str | None = None,
+    http_client: Optional[httpx.AsyncClient] = None,
+    api_key: str | None = None,
 ) -> Any:
     if AsyncAnthropic is None:  # pragma: no cover
         raise RuntimeError(
             "anthropic is not installed. Install `meshagent-anthropic` extras/deps."
         )
-
-    token: str = room.protocol.token
-
-    url = getattr(room.protocol, "url")
-    if url is None:
-        logger.debug(
-            "protocol does not have url, anthropic client falling back to room url %s",
-            room.room_url,
-        )
-        url = room.room_url
-    else:
-        logger.debug("protocol had url, anthropic client will use %s", url)
-
-    room_proxy_url = f"{url}/anthropic"
-
-    if room_proxy_url.startswith("ws:") or room_proxy_url.startswith("wss:"):
-        room_proxy_url = room_proxy_url.replace("ws", "http", 1)
-
-    # The MeshAgent room proxy validates `x-api-key` and `Meshagent-Session`.
-    return AsyncAnthropic(
-        api_key=token,
-        base_url=room_proxy_url,
-        http_client=http_client,
-        default_headers={"Meshagent-Session": room.session_id},
-    )
+    if base_url is None:
+        base_url = os.getenv("ANTHROPIC_BASE_URL")
+    if base_url is not None:
+        base_url = base_url.strip() or None
+    kwargs: dict[str, object] = {}
+    if api_key is not None:
+        kwargs["api_key"] = api_key
+    if base_url is not None:
+        kwargs["base_url"] = base_url
+    if http_client is not None:
+        kwargs["http_client"] = http_client
+    return AsyncAnthropic(**kwargs)
