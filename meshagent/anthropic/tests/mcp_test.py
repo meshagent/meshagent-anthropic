@@ -1,15 +1,13 @@
-from meshagent.anthropic.mcp import MCPConfig, MCPServer, MCPTool, MCPToolset
+from meshagent.anthropic.mcp import MCPServer, MCPTool, MCPToolset
 
 
 def test_mcp_tool_apply_injects_servers_toolsets_and_beta():
-    cfg = MCPConfig(
+    tool = MCPTool(
         mcp_servers=[
             MCPServer(url="https://mcp.example.com/sse", name="example-mcp"),
         ],
         toolsets=[MCPToolset(mcp_server_name="example-mcp")],
     )
-
-    tool = MCPTool(config=cfg)
     request: dict = {"tools": []}
     headers: dict = {}
     tool.apply(request=request, headers=headers)
@@ -28,13 +26,12 @@ def test_mcp_tool_apply_injects_servers_toolsets_and_beta():
 
 
 def test_mcp_tool_apply_dedupes_servers_by_name_and_preserves_existing():
-    cfg = MCPConfig(
+    tool = MCPTool(
         mcp_servers=[
             MCPServer(url="https://mcp.example.com/sse", name="example-mcp"),
             MCPServer(url="https://mcp.other.com/sse", name="other"),
         ]
     )
-    tool = MCPTool(config=cfg)
 
     request: dict = {
         "tools": [{"type": "tool", "name": "some_tool"}],

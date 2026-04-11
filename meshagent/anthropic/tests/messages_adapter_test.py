@@ -663,7 +663,7 @@ async def test_next_batches_multiple_tool_results_into_single_user_message():
 
     result = await adapter.next(
         context=ctx,
-        room=_DummyRoom(),
+        caller=_DummyRoom().local_participant,
         toolkits=[toolkit],
     )
 
@@ -712,7 +712,7 @@ async def test_next_passes_thread_and_turn_ids_in_tool_caller_context():
 
     result = await adapter.next(
         context=ctx,
-        room=_DummyRoom(),
+        caller=_DummyRoom().local_participant,
         toolkits=[Toolkit(name="test", tools=[tool])],
     )
 
@@ -775,7 +775,7 @@ async def test_next_uses_final_stream_item_as_tool_result() -> None:
     toolkit = Toolkit(name="test", tools=[_StreamingTool("tool_a")])
     result = await adapter.next(
         context=ctx,
-        room=_DummyRoom(),
+        caller=_DummyRoom().local_participant,
         toolkits=[toolkit],
     )
 
@@ -861,7 +861,6 @@ async def test_messages_tool_bundle_execute_respects_explicit_validation_mode():
 
     result = await tool_bundle.execute(
         context=ToolContext(
-            room=_DummyRoom(),
             caller=_DummyParticipant(),
         ),
         tool_use={"name": "tool_a", "id": "toolu_1", "input": {"count": 9}},
@@ -1102,7 +1101,7 @@ async def test_next_uses_model_specific_max_tokens_default() -> None:
 
     result = await adapter.next(
         context=context,
-        room=_DummyRoom(),
+        caller=_DummyRoom().local_participant,
         toolkits=[],
         model="claude-sonnet-4-6",
     )
@@ -1122,7 +1121,7 @@ async def test_next_uses_higher_opus_4_6_model_specific_max_tokens_default() -> 
 
     result = await adapter.next(
         context=context,
-        room=_DummyRoom(),
+        caller=_DummyRoom().local_participant,
         toolkits=[],
         model="claude-opus-4-6",
     )
@@ -1143,7 +1142,7 @@ async def test_next_prefers_explicit_max_tokens_over_model_default() -> None:
 
     result = await adapter.next(
         context=context,
-        room=_DummyRoom(),
+        caller=_DummyRoom().local_participant,
         toolkits=[],
     )
 
@@ -1163,7 +1162,7 @@ async def test_next_prefers_env_max_tokens_over_model_default(monkeypatch) -> No
 
     result = await adapter.next(
         context=context,
-        room=_DummyRoom(),
+        caller=_DummyRoom().local_participant,
         toolkits=[],
     )
 
@@ -1183,7 +1182,7 @@ async def test_next_uses_native_output_config_with_strict_schema() -> None:
 
     result = await adapter.next(
         context=ctx,
-        room=_DummyRoom(),
+        caller=_DummyRoom().local_participant,
         toolkits=[],
         output_schema={
             "type": "object",
@@ -1218,7 +1217,7 @@ async def test_next_transforms_unsupported_numeric_output_constraints() -> None:
 
     result = await adapter.next(
         context=ctx,
-        room=_DummyRoom(),
+        caller=_DummyRoom().local_participant,
         toolkits=[],
         output_schema={
             "type": "object",
@@ -1266,7 +1265,7 @@ async def test_next_normalizes_nullable_union_types_in_output_schema() -> None:
 
     result = await adapter.next(
         context=ctx,
-        room=_DummyRoom(),
+        caller=_DummyRoom().local_participant,
         toolkits=[],
         output_schema={
             "type": "object",
@@ -1337,7 +1336,7 @@ async def test_next_adaptive_mode_retries_with_loose_tools_after_grammar_error(
 
     result = await adapter.next(
         context=ctx,
-        room=_DummyRoom(),
+        caller=_DummyRoom().local_participant,
         toolkits=[Toolkit(name="test", tools=[tool])],
     )
 
@@ -1388,7 +1387,7 @@ async def test_next_adaptive_mode_enables_strict_after_local_tool_validation_fai
 
     result = await adapter.next(
         context=ctx,
-        room=_DummyRoom(),
+        caller=_DummyRoom().local_participant,
         toolkits=[Toolkit(name="storage", tools=[tool])],
     )
 
@@ -1435,7 +1434,7 @@ async def test_next_inserts_steering_messages_after_tool_results() -> None:
 
     result = await adapter.next(
         context=context,
-        room=_DummyRoom(),
+        caller=_DummyRoom().local_participant,
         toolkits=[Toolkit(name="test", tools=[_AnyArgsTool("tool_a")])],
         steering_callback=_steer,
     )
@@ -1501,7 +1500,7 @@ async def test_steering_followup_request_matches_plain_transcript_shape() -> Non
 
     result = await adapter.next(
         context=context,
-        room=_DummyRoom(),
+        caller=_DummyRoom().local_participant,
         toolkits=[Toolkit(name="test", tools=[_AnyArgsTool("tool_a")])],
         steering_callback=_steer,
     )
@@ -1611,7 +1610,7 @@ async def test_next_inserts_steering_before_trailing_tool_messages(
 
     result = await adapter.next(
         context=context,
-        room=_DummyRoom(),
+        caller=_DummyRoom().local_participant,
         toolkits=[Toolkit(name="test", tools=[_AnyArgsTool("tool_a")])],
         steering_callback=_steer,
     )
@@ -1696,7 +1695,7 @@ async def test_next_inserts_steering_after_first_completed_tool_when_multiple_to
     task = asyncio.create_task(
         adapter.next(
             context=context,
-            room=_DummyRoom(),
+            caller=_DummyRoom().local_participant,
             toolkits=[Toolkit(name="test", tools=[tool_a, tool_b])],
             steering_callback=_steer,
         )
@@ -1784,7 +1783,7 @@ async def test_next_restores_context_when_cancelled_during_tool_call() -> None:
     task = asyncio.create_task(
         adapter.next(
             context=context,
-            room=_DummyRoom(),
+            caller=_DummyRoom().local_participant,
             toolkits=[Toolkit(name="test", tools=[blocking_tool])],
         )
     )
@@ -1825,7 +1824,7 @@ async def test_next_raises_on_truncated_tool_calls_before_appending_assistant_me
     ):
         await adapter.next(
             context=context,
-            room=_DummyRoom(),
+            caller=_DummyRoom().local_participant,
             toolkits=[Toolkit(name="storage", tools=[_WriteFileLikeTool()])],
         )
 
@@ -1878,7 +1877,7 @@ async def test_next_marks_truncated_streamed_tool_calls_as_failed(
     ):
         await adapter.next(
             context=context,
-            room=_DummyRoom(),
+            caller=_DummyRoom().local_participant,
             toolkits=[Toolkit(name="storage", tools=[_WriteFileLikeTool()])],
             event_handler=events.append,
         )
@@ -1921,7 +1920,7 @@ async def test_next_continues_on_pause_turn() -> None:
 
     result = await adapter.next(
         context=context,
-        room=_DummyRoom(),
+        caller=_DummyRoom().local_participant,
         toolkits=[],
     )
 
@@ -1965,7 +1964,7 @@ async def test_next_raises_on_truncated_text_response_after_appending_assistant_
     ):
         await adapter.next(
             context=context,
-            room=_DummyRoom(),
+            caller=_DummyRoom().local_participant,
             toolkits=[],
         )
 
@@ -1995,7 +1994,7 @@ async def test_next_raises_on_model_context_window_exceeded_after_appending_assi
     ):
         await adapter.next(
             context=context,
-            room=_DummyRoom(),
+            caller=_DummyRoom().local_participant,
             toolkits=[],
         )
 
@@ -2089,7 +2088,7 @@ async def test_next_adds_auto_compaction_request_fields() -> None:
 
     result = await adapter.next(
         context=context,
-        room=_DummyRoom(),
+        caller=_DummyRoom().local_participant,
         toolkits=[],
     )
 
@@ -2121,7 +2120,7 @@ async def test_next_preserves_existing_betas_when_adding_compaction_beta() -> No
 
     result = await adapter.next(
         context=context,
-        room=_DummyRoom(),
+        caller=_DummyRoom().local_participant,
         toolkits=[],
     )
 
@@ -2144,7 +2143,7 @@ async def test_next_skips_auto_compaction_for_legacy_model_versions() -> None:
 
     result = await adapter.next(
         context=context,
-        room=_DummyRoom(),
+        caller=_DummyRoom().local_participant,
         toolkits=[],
     )
 
@@ -2172,7 +2171,7 @@ async def test_next_locally_compacts_anthropic_request_before_send() -> None:
 
     result = await adapter.next(
         context=context,
-        room=_DummyRoom(),
+        caller=_DummyRoom().local_participant,
         toolkits=[],
     )
 
@@ -2225,7 +2224,7 @@ async def test_next_retries_after_prompt_too_long_with_local_compaction(
 
     result = await adapter.next(
         context=context,
-        room=_DummyRoom(),
+        caller=_DummyRoom().local_participant,
         toolkits=[],
     )
 
@@ -2260,7 +2259,7 @@ async def test_next_uses_context_management_beta_for_non_compaction_edits() -> N
 
     result = await adapter.next(
         context=context,
-        room=_DummyRoom(),
+        caller=_DummyRoom().local_participant,
         toolkits=[],
     )
 
@@ -2284,7 +2283,7 @@ async def test_next_merges_header_betas_into_request_betas_for_web_fetch_compact
 
     result = await adapter.next(
         context=context,
-        room=_DummyRoom(),
+        caller=_DummyRoom().local_participant,
         toolkits=[Toolkit(name="web_fetch", tools=[WebFetchTool()])],
     )
 
@@ -2325,7 +2324,7 @@ async def test_next_stores_usage_metadata() -> None:
 
     result = await adapter.next(
         context=context,
-        room=_DummyRoom(),
+        caller=_DummyRoom().local_participant,
         toolkits=[],
     )
 
@@ -2363,7 +2362,7 @@ async def test_next_stores_usage_for_streaming_response(monkeypatch) -> None:
 
     result = await adapter.next(
         context=context,
-        room=_DummyRoom(),
+        caller=_DummyRoom().local_participant,
         toolkits=[],
         event_handler=events.append,
     )
@@ -2396,7 +2395,7 @@ async def test_next_streams_without_event_handler(monkeypatch) -> None:
 
     result = await adapter.next(
         context=context,
-        room=_DummyRoom(),
+        caller=_DummyRoom().local_participant,
         toolkits=[],
     )
 
@@ -2417,7 +2416,7 @@ async def test_next_accepts_options_keyword_argument() -> None:
 
     result = await adapter.next(
         context=context,
-        room=_DummyRoom(),
+        caller=_DummyRoom().local_participant,
         toolkits=[],
         options={"reasoning": {"effort": "none"}},
     )
@@ -2467,7 +2466,7 @@ async def test_next_retries_after_retryable_anthropic_status_error(
     with caplog.at_level(logging.WARNING, logger="anthropic_agent"):
         result = await adapter.next(
             context=context,
-            room=_DummyRoom(),
+            caller=_DummyRoom().local_participant,
             toolkits=[],
             event_handler=events.append,
         )
@@ -2540,7 +2539,7 @@ async def test_next_retries_after_anthropic_connection_error(
 
     result = await adapter.next(
         context=context,
-        room=_DummyRoom(),
+        caller=_DummyRoom().local_participant,
         toolkits=[],
         event_handler=events.append,
     )

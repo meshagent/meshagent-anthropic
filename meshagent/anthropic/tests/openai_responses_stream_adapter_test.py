@@ -226,7 +226,7 @@ async def test_openai_responses_stream_next_forwards_options(monkeypatch):
         self,
         *,
         context,
-        room,
+        caller,
         toolkits,
         output_schema=None,
         event_handler=None,
@@ -237,7 +237,7 @@ async def test_openai_responses_stream_next_forwards_options(monkeypatch):
     ):
         del self
         del context
-        del room
+        del caller
         del toolkits
         del output_schema
         del event_handler
@@ -253,7 +253,7 @@ async def test_openai_responses_stream_next_forwards_options(monkeypatch):
 
     result = await adapter.next(
         context=AgentSessionContext(system_role=None),
-        room=object(),
+        caller=object(),
         toolkits=[],
         options={"reasoning": {"effort": "none"}},
     )
@@ -270,7 +270,7 @@ async def test_openai_responses_stream_next_forwards_steering_callback(monkeypat
         self,
         *,
         context,
-        room,
+        caller,
         toolkits,
         output_schema=None,
         event_handler=None,
@@ -281,7 +281,7 @@ async def test_openai_responses_stream_next_forwards_steering_callback(monkeypat
     ):
         del self
         del context
-        del room
+        del caller
         del toolkits
         del output_schema
         del event_handler
@@ -305,7 +305,7 @@ async def test_openai_responses_stream_next_forwards_steering_callback(monkeypat
 
     result = await adapter.next(
         context=AgentSessionContext(system_role=None),
-        room=object(),
+        caller=object(),
         toolkits=[],
         steering_callback=_steer,
     )

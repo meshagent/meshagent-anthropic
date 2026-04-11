@@ -6,7 +6,7 @@ import copy
 import pytest
 
 from meshagent.anthropic.messages_adapter import AnthropicMessagesAdapter
-from meshagent.anthropic.mcp import MCPConfig, MCPServer, MCPTool
+from meshagent.anthropic.mcp import MCPServer, MCPTool
 from meshagent.agents.agent import AgentSessionContext
 from meshagent.tools import FunctionTool, Toolkit
 
@@ -137,7 +137,11 @@ async def test_live_anthropic_adapter_messages_create_if_key_set():
     ctx = AgentSessionContext(system_role=None)
     ctx.append_user_message("Say hello in one word.")
 
-    text = await adapter.next(context=ctx, room=_DummyRoom(), toolkits=[])
+    text = await adapter.next(
+        context=ctx,
+        caller=_DummyRoom().local_participant,
+        toolkits=[],
+    )
 
     assert isinstance(text, str)
     assert len(text.strip()) > 0
@@ -165,7 +169,7 @@ async def test_live_anthropic_adapter_streaming_if_key_set():
 
     text = await adapter.next(
         context=ctx,
-        room=_DummyRoom(),
+        caller=_DummyRoom().local_participant,
         toolkits=[],
         event_handler=handler,
     )
@@ -197,11 +201,9 @@ async def test_live_anthropic_mcp_deepwiki_if_key_set():
         name="mcp",
         tools=[
             MCPTool(
-                config=MCPConfig(
-                    mcp_servers=[
-                        MCPServer(url="https://mcp.deepwiki.com/mcp", name="deepwiki")
-                    ]
-                )
+                mcp_servers=[
+                    MCPServer(url="https://mcp.deepwiki.com/mcp", name="deepwiki")
+                ]
             )
         ],
     )
@@ -223,7 +225,7 @@ async def test_live_anthropic_mcp_deepwiki_if_key_set():
 
     text = await adapter.next(
         context=ctx,
-        room=_DummyRoom(),
+        caller=_DummyRoom().local_participant,
         toolkits=[mcp_toolkit],
         event_handler=handler,
     )
@@ -262,7 +264,11 @@ async def test_live_anthropic_adapter_compaction_if_key_set():
     )
 
     try:
-        first = await adapter.next(context=ctx, room=_DummyRoom(), toolkits=[])
+        first = await adapter.next(
+            context=ctx,
+            caller=_DummyRoom().local_participant,
+            toolkits=[],
+        )
     except Exception as ex:
         message = str(ex)
         if "does not support the 'compact_20260112'" in message:
@@ -271,7 +277,11 @@ async def test_live_anthropic_adapter_compaction_if_key_set():
     assert isinstance(first, str)
 
     ctx.append_user_message("Now reply with the single word 'done'.")
-    second = await adapter.next(context=ctx, room=_DummyRoom(), toolkits=[])
+    second = await adapter.next(
+        context=ctx,
+        caller=_DummyRoom().local_participant,
+        toolkits=[],
+    )
     assert isinstance(second, str)
     assert len(second.strip()) > 0
     assert ctx.metadata.get("last_response_model") == model
@@ -313,7 +323,7 @@ async def test_live_anthropic_inserts_steer_immediately_after_tool_results_if_ke
     task = asyncio.create_task(
         adapter.next(
             context=ctx,
-            room=_DummyRoom(),
+            caller=_DummyRoom().local_participant,
             toolkits=[Toolkit(name="test", tools=[tool])],
             event_handler=lambda event: None,
             steering_callback=_steer,
@@ -381,7 +391,7 @@ async def test_live_anthropic_inserts_steer_after_first_completed_tool_when_two_
     task = asyncio.create_task(
         adapter.next(
             context=ctx,
-            room=_DummyRoom(),
+            caller=_DummyRoom().local_participant,
             toolkits=[Toolkit(name="test", tools=[alpha_tool, beta_tool])],
             event_handler=lambda event: None,
             steering_callback=_steer,
@@ -492,7 +502,7 @@ async def test_live_anthropic_keeps_plain_user_turn_after_tool_result_if_key_set
 
     result = await adapter.next(
         context=ctx,
-        room=_DummyRoom(),
+        caller=_DummyRoom().local_participant,
         toolkits=[Toolkit(name="test", tools=[_SteeringProbeTool()])],
         event_handler=lambda event: None,
     )

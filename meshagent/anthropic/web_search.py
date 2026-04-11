@@ -4,18 +4,7 @@ from typing import Literal, Optional
 
 from pydantic import BaseModel
 
-from meshagent.tools import Toolkit, ToolkitBuilder, ToolkitConfig
-
 from .request_tool import AnthropicRequestTool
-
-
-class WebSearchConfig(ToolkitConfig):
-    name: Literal["web_search"] = "web_search"
-    max_uses: Optional[int] = None
-    allowed_domains: Optional[list[str]] = None
-    blocked_domains: Optional[list[str]] = None
-    user_location: Optional["WebSearchUserLocation"] = None
-    betas: Optional[list[str]] = None
 
 
 class WebSearchUserLocation(BaseModel):
@@ -27,14 +16,25 @@ class WebSearchUserLocation(BaseModel):
 
 
 class WebSearchTool(AnthropicRequestTool):
-    def __init__(self, *, config: Optional[WebSearchConfig] = None):
-        if config is None:
-            config = WebSearchConfig(name="web_search")
-        super().__init__(name=config.name)
-        self.config = config
+    def __init__(
+        self,
+        *,
+        name: str = "web_search",
+        max_uses: int | None = None,
+        allowed_domains: list[str] | None = None,
+        blocked_domains: list[str] | None = None,
+        user_location: WebSearchUserLocation | None = None,
+        betas: list[str] | None = None,
+    ):
+        super().__init__(name=name)
+        self.max_uses = max_uses
+        self.allowed_domains = allowed_domains
+        self.blocked_domains = blocked_domains
+        self.user_location = user_location
+        self.betas = betas
 
     def apply(self, *, request: dict, headers: dict) -> None:
-        if self.config.allowed_domains and self.config.blocked_domains:
+        if self.allowed_domains and self.blocked_domains:
             raise ValueError(
                 "web_search cannot set both allowed_domains and blocked_domains"
             )
@@ -42,16 +42,16 @@ class WebSearchTool(AnthropicRequestTool):
         tools = request.setdefault("tools", [])
         tool_def: dict[str, object] = {
             "type": "web_search_20250305",
-            "name": self.config.name,
+            "name": self.name,
         }
-        if self.config.max_uses is not None:
-            tool_def["max_uses"] = self.config.max_uses
-        if self.config.allowed_domains is not None:
-            tool_def["allowed_domains"] = self.config.allowed_domains
-        if self.config.blocked_domains is not None:
-            tool_def["blocked_domains"] = self.config.blocked_domains
-        if self.config.user_location is not None:
-            tool_def["user_location"] = self.config.user_location.model_dump(
+        if self.max_uses is not None:
+            tool_def["max_uses"] = self.max_uses
+        if self.allowed_domains is not None:
+            tool_def["allowed_domains"] = self.allowed_domains
+        if self.blocked_domains is not None:
+            tool_def["blocked_domains"] = self.blocked_domains
+        if self.user_location is not None:
+            tool_def["user_location"] = self.user_location.model_dump(
                 mode="json", exclude_none=True
             )
         if not any(
@@ -62,13 +62,4 @@ class WebSearchTool(AnthropicRequestTool):
         ):
             tools.append(tool_def)
 
-        self.apply_betas(headers=headers, betas=self.config.betas)
-
-
-class WebSearchToolkitBuilder(ToolkitBuilder):
-    def __init__(self):
-        super().__init__(name="web_search", type=WebSearchConfig)
-
-    async def make(self, *, model: str, config: WebSearchConfig) -> Toolkit:
-        del model
-        return Toolkit(name="web_search", tools=[WebSearchTool(config=config)])
+        self.apply_betas(headers=headers, betas=self.betas)

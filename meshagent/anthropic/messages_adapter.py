@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from meshagent.agents.agent import AgentSessionContext
-from meshagent.api import RoomClient, RoomException, RemoteParticipant
+from meshagent.api import Participant, RoomException
 from meshagent.agents.event_publisher import (
     _AnthropicAgentEventPublisher,
     make_anthropic_agent_event_publisher,
@@ -1884,13 +1884,13 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
         self,
         *,
         context: AgentSessionContext,
-        room: RoomClient,
+        caller: Participant,
         toolkits: list[Toolkit],
         output_schema: Optional[dict] = None,
         event_handler: Optional[Callable[[dict], None]] = None,
         steering_callback: SteeringCallback | None = None,
         model: Optional[str] = None,
-        on_behalf_of: Optional[RemoteParticipant] = None,
+        on_behalf_of: Optional[Participant] = None,
         options: Optional[dict] = None,
     ) -> Any:
         del options
@@ -2197,8 +2197,7 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
                             else None
                         )
                         tool_context = ToolContext(
-                            room=room,
-                            caller=room.local_participant,
+                            caller=caller,
                             on_behalf_of=on_behalf_of,
                             caller_context=caller_context,
                             event_handler=event_handler,

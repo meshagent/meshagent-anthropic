@@ -4,7 +4,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
-from meshagent.api import RoomClient, RemoteParticipant
+from meshagent.api import Participant
 from meshagent.agents.agent import AgentSessionContext
 from meshagent.agents.adapter import SteeringCallback
 from meshagent.tools import Toolkit
@@ -391,18 +391,18 @@ class AnthropicOpenAIResponsesStreamAdapter(AnthropicMessagesAdapter):
         self,
         *,
         context: AgentSessionContext,
-        room: RoomClient,
+        caller: Participant,
         toolkits: list[Toolkit],
         output_schema: Optional[dict] = None,
         event_handler: Optional[Callable[[dict], None]] = None,
         steering_callback: SteeringCallback | None = None,
         model: Optional[str] = None,
-        on_behalf_of: Optional[RemoteParticipant] = None,
+        on_behalf_of: Optional[Participant] = None,
         options: Optional[dict] = None,
     ) -> Any:
         return await super().next(
             context=context,
-            room=room,
+            caller=caller,
             toolkits=toolkits,
             output_schema=output_schema,
             event_handler=event_handler,
