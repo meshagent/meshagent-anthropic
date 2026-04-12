@@ -3,6 +3,7 @@ import json
 import httpx
 import os
 from typing import Optional, Any
+from meshagent.api.urls import meshagent_base_url
 
 try:
     from anthropic import AsyncAnthropic
@@ -56,6 +57,29 @@ def get_logging_httpx_client() -> httpx.AsyncClient:
     )
 
 
+def resolve_base_url(base_url: str | None = None) -> str:
+    resolved = base_url
+    if resolved is None:
+        resolved = os.getenv("ANTHROPIC_BASE_URL")
+    if resolved is not None:
+        resolved = resolved.strip() or None
+    if resolved is not None:
+        return resolved
+    return f"{meshagent_base_url().rstrip('/')}/anthropic"
+
+
+def resolve_api_key(api_key: str | None = None) -> str | None:
+    resolved = api_key
+    if resolved is None:
+        resolved = os.getenv("ANTHROPIC_API_KEY")
+    if resolved is None or resolved.strip() == "":
+        resolved = os.getenv("MESHAGENT_TOKEN")
+    if resolved is None:
+        return None
+    resolved = resolved.strip()
+    return resolved or None
+
+
 def get_client(
     *,
     base_url: str | None = None,
@@ -66,15 +90,12 @@ def get_client(
         raise RuntimeError(
             "anthropic is not installed. Install `meshagent-anthropic` extras/deps."
         )
-    if base_url is None:
-        base_url = os.getenv("ANTHROPIC_BASE_URL")
-    if base_url is not None:
-        base_url = base_url.strip() or None
+    resolved_base_url = resolve_base_url(base_url)
+    resolved_api_key = resolve_api_key(api_key)
     kwargs: dict[str, object] = {}
-    if api_key is not None:
-        kwargs["api_key"] = api_key
-    if base_url is not None:
-        kwargs["base_url"] = base_url
+    if resolved_api_key is not None:
+        kwargs["api_key"] = resolved_api_key
+    kwargs["base_url"] = resolved_base_url
     if http_client is not None:
         kwargs["http_client"] = http_client
     return AsyncAnthropic(**kwargs)

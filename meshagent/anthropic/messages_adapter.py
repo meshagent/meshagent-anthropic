@@ -40,7 +40,12 @@ import copy
 from html_to_markdown import convert
 from urllib.parse import urlparse
 
-from meshagent.anthropic.proxy import get_client, get_logging_httpx_client
+from meshagent.anthropic.proxy import (
+    get_client,
+    get_logging_httpx_client,
+    resolve_api_key,
+    resolve_base_url,
+)
 from meshagent.anthropic.request_tool import AnthropicRequestTool
 from meshagent.anthropic.usage import (
     add_usage_metrics,
@@ -884,6 +889,7 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
         tool_calling_mode: ToolCallingMode = "adaptive",
         *,
         base_url: str | None = None,
+        api_key: str | None = None,
         max_tool_call_length: int = DEFAULT_MAX_TOOL_CALL_LENGTH,
         max_tool_call_lines: int = DEFAULT_MAX_TOOL_CALL_LINES,
     ):
@@ -907,11 +913,8 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
             else max_tokens
         )
         self._client = client
-        if base_url is None:
-            base_url = os.getenv("ANTHROPIC_BASE_URL")
-        if base_url is not None:
-            base_url = base_url.strip() or None
-        self._base_url = base_url
+        self._base_url = resolve_base_url(base_url)
+        self._api_key = resolve_api_key(api_key)
         self._message_options = message_options or {}
         self._provider = provider
         self._log_requests = log_requests
@@ -1021,7 +1024,11 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
         if self._client is not None:
             return self._client
         http_client = get_logging_httpx_client() if self._log_requests else None
-        return get_client(base_url=self._base_url, http_client=http_client)
+        return get_client(
+            base_url=self._base_url,
+            api_key=self._api_key,
+            http_client=http_client,
+        )
 
     def _is_retryable_anthropic_error(self, *, error: APIError) -> bool:
         if isinstance(error, APIStatusError):

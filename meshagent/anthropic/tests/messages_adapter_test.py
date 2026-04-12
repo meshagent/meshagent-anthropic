@@ -147,7 +147,10 @@ async def test_get_input_tokens_does_not_require_room() -> None:
 
 
 def test_anthropic_adapter_passes_base_url_to_get_client(monkeypatch) -> None:
-    adapter = AnthropicMessagesAdapter(base_url="https://anthropic.example.test")
+    adapter = AnthropicMessagesAdapter(
+        base_url="https://anthropic.example.test",
+        api_key="test-token",
+    )
     fake_client = object()
     call_args: dict[str, object] = {}
 
@@ -167,7 +170,7 @@ def test_anthropic_adapter_passes_base_url_to_get_client(monkeypatch) -> None:
     assert client is fake_client
     assert call_args["base_url"] == "https://anthropic.example.test"
     assert call_args["http_client"] is None
-    assert call_args["api_key"] is None
+    assert call_args["api_key"] == "test-token"
 
 
 def test_anthropic_adapter_reads_base_url_from_environment(monkeypatch) -> None:
