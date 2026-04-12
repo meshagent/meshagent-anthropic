@@ -3,6 +3,7 @@ from .messages_adapter import (
     AnthropicMessagesToolResponseAdapter,
 )
 from .mcp import (
+    AnthropicMessagesMCPToolkit,
     MCPServer,
     MCPTool,
     MCPToolConfig,
@@ -24,6 +25,7 @@ __all__ = [
     AnthropicThreadAdapter,
     AnthropicThreadConversation,
     AnthropicThreadMessage,
+    AnthropicMessagesMCPToolkit,
     MCPServer,
     MCPTool,
     MCPToolConfig,

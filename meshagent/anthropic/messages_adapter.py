@@ -6,7 +6,7 @@ from meshagent.agents.event_publisher import (
     _AnthropicAgentEventPublisher,
     make_anthropic_agent_event_publisher,
 )
-from meshagent.agents.messages import AgentMessage
+from meshagent.agents.messages import AgentMessage, ToolChoice
 from meshagent.tools import Toolkit, ToolContext, FunctionTool, BaseTool
 from meshagent.tools.tool import ValidationMode
 from meshagent.api.messaging import (
@@ -41,7 +41,6 @@ from html_to_markdown import convert
 from urllib.parse import urlparse
 
 from meshagent.anthropic.proxy import get_client, get_logging_httpx_client
-from meshagent.anthropic.mcp import MCPTool as MCPConnectorTool
 from meshagent.anthropic.request_tool import AnthropicRequestTool
 from meshagent.anthropic.usage import (
     add_usage_metrics,
@@ -1840,15 +1839,10 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
             executable_tools: list[FunctionTool] = []
 
             for t in toolkit.tools:
-                if isinstance(t, MCPConnectorTool):
+                if isinstance(t, AnthropicRequestTool):
                     middleware.append(t)
                 elif isinstance(t, FunctionTool):
                     executable_tools.append(t)
-                elif isinstance(t, BaseTool):
-                    if hasattr(t, "apply") and callable(getattr(t, "apply")):
-                        middleware.append(t)
-                    # Non-executable tool types are ignored.
-                    continue
                 else:
                     raise RoomException(f"unsupported tool type {type(t)}")
 
@@ -1856,10 +1850,10 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
                 executable_toolkits.append(
                     Toolkit(
                         name=toolkit.name,
-                        title=getattr(toolkit, "title", None),
-                        description=getattr(toolkit, "description", None),
-                        thumbnail_url=getattr(toolkit, "thumbnail_url", None),
-                        rules=getattr(toolkit, "rules", []),
+                        title=toolkit.title,
+                        description=toolkit.description,
+                        thumbnail_url=toolkit.thumbnail_url,
+                        rules=[*toolkit.rules],
                         tools=executable_tools,
                     )
                 )
@@ -1871,14 +1865,56 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
     ) -> dict:
         headers = request.get("extra_headers") or {}
         for m in middleware:
-            apply = getattr(m, "apply", None)
-            if callable(apply):
-                try:
-                    apply(request=request, headers=headers)
-                except TypeError:
-                    apply(request=request)
+            if not isinstance(m, AnthropicRequestTool):
+                raise RoomException(f"unsupported request middleware type {type(m)}")
+            m.apply(request=request, headers=headers)
         request["extra_headers"] = headers or None
         return request
+
+    def _resolve_tool_choice(
+        self,
+        *,
+        toolkits: list[Toolkit],
+        tool_choice: ToolChoice | None,
+    ) -> dict[str, Any] | None:
+        if tool_choice is None:
+            return None
+
+        selected_toolkit = next(
+            (
+                toolkit
+                for toolkit in toolkits
+                if toolkit.name == tool_choice.toolkit_name
+            ),
+            None,
+        )
+        if selected_toolkit is None:
+            raise RoomException(
+                f"unknown toolkit in tool_choice: {tool_choice.toolkit_name}"
+            )
+
+        selected_tool = next(
+            (
+                tool
+                for tool in selected_toolkit.tools
+                if tool.name == tool_choice.tool_name
+            ),
+            None,
+        )
+        if selected_tool is None:
+            raise RoomException(
+                f"unknown tool in tool_choice: {tool_choice.toolkit_name}.{tool_choice.tool_name}"
+            )
+        if not isinstance(selected_tool, FunctionTool):
+            raise RoomException(
+                f"tool_choice is not supported for {type(selected_tool).__name__}"
+            )
+
+        return {
+            "type": "tool",
+            "name": safe_tool_name(selected_tool.name),
+            "disable_parallel_tool_use": True,
+        }
 
     async def next(
         self,
@@ -1891,6 +1927,7 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
         steering_callback: SteeringCallback | None = None,
         model: Optional[str] = None,
         on_behalf_of: Optional[Participant] = None,
+        tool_choice: ToolChoice | None = None,
         options: Optional[dict] = None,
     ) -> Any:
         del options
@@ -1974,6 +2011,10 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
                     "messages": messages,
                     "system": system,
                     "tools": tools_list,
+                    "tool_choice": self._resolve_tool_choice(
+                        toolkits=executable_toolkits,
+                        tool_choice=tool_choice,
+                    ),
                     "extra_headers": extra_headers or None,
                     **message_options,
                 }

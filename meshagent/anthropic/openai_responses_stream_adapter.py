@@ -7,6 +7,7 @@ from typing import Any, Callable, Optional
 from meshagent.api import Participant
 from meshagent.agents.agent import AgentSessionContext
 from meshagent.agents.adapter import SteeringCallback
+from meshagent.agents.messages import ToolChoice
 from meshagent.tools import Toolkit
 
 from .messages_adapter import AnthropicMessagesAdapter
@@ -398,6 +399,7 @@ class AnthropicOpenAIResponsesStreamAdapter(AnthropicMessagesAdapter):
         steering_callback: SteeringCallback | None = None,
         model: Optional[str] = None,
         on_behalf_of: Optional[Participant] = None,
+        tool_choice: ToolChoice | None = None,
         options: Optional[dict] = None,
     ) -> Any:
         return await super().next(
@@ -409,5 +411,6 @@ class AnthropicOpenAIResponsesStreamAdapter(AnthropicMessagesAdapter):
             steering_callback=steering_callback,
             model=model,
             on_behalf_of=on_behalf_of,
+            tool_choice=tool_choice,
             options=options,
         )

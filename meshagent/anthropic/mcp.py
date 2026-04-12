@@ -4,6 +4,9 @@ from typing import Literal, Optional
 
 from pydantic import BaseModel
 
+from meshagent.agents.mcp import MCPServerConfig, MCPToolkitClientOptions
+from meshagent.tools import BaseTool, Toolkit
+
 from .request_tool import AnthropicRequestTool
 
 
@@ -80,3 +83,63 @@ class MCPTool(AnthropicRequestTool):
         tools = request.setdefault("tools", [])
         for toolset in toolsets:
             tools.append(toolset.model_dump(mode="json", exclude_none=True))
+
+
+def _merge_mcp_server_configs(
+    *,
+    static_servers: list[MCPServerConfig],
+    client_options: dict | None,
+) -> list[MCPServerConfig]:
+    merged_by_label: dict[str, MCPServerConfig] = {
+        server.server_label: server for server in static_servers
+    }
+    if client_options is None:
+        return list(merged_by_label.values())
+
+    options = MCPToolkitClientOptions.model_validate(client_options)
+    for server in options.servers:
+        merged_by_label[server.server_label] = server
+    return list(merged_by_label.values())
+
+
+class AnthropicMessagesMCPToolkit(Toolkit):
+    def __init__(
+        self,
+        *,
+        servers: list[MCPServerConfig] | None = None,
+        title: str | None = None,
+        description: str | None = None,
+        hidden: bool = False,
+    ) -> None:
+        super().__init__(
+            name="mcp",
+            title=title,
+            description=description,
+            tools=[],
+            client_options=MCPToolkitClientOptions.model_json_schema(),
+            hidden=hidden,
+        )
+        self._servers = [*(servers or [])]
+
+    def get_tools(self, *, client_options: dict | None = None) -> list[BaseTool]:
+        servers = _merge_mcp_server_configs(
+            static_servers=self._servers,
+            client_options=client_options,
+        )
+        resolved_tools: list[BaseTool] = []
+        for server in servers:
+            if server.server_url is None or server.server_url.strip() == "":
+                continue
+            resolved_tools.append(
+                MCPTool(
+                    name=server.server_label,
+                    mcp_servers=[
+                        MCPServer(
+                            url=server.server_url,
+                            name=server.server_label,
+                            authorization_token=server.authorization,
+                        )
+                    ],
+                )
+            )
+        return resolved_tools
