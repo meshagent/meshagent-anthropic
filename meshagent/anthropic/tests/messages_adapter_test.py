@@ -1088,6 +1088,7 @@ def test_default_max_tokens_for_model_uses_model_family_defaults() -> None:
     assert _default_max_tokens_for_model("claude-sonnet-4-6") == 64_000
     assert _default_max_tokens_for_model("claude-sonnet-4-5") == 64_000
     assert _default_max_tokens_for_model("claude-3-7-sonnet-latest") == 64_000
+    assert _default_max_tokens_for_model("claude-opus-4-7") == 128_000
     assert _default_max_tokens_for_model("claude-opus-4-6") == 128_000
     assert _default_max_tokens_for_model("claude-opus-4-1") == 32_000
     assert _default_max_tokens_for_model("claude-3-5-sonnet-latest") == 8_192
@@ -1127,6 +1128,26 @@ async def test_next_uses_higher_opus_4_6_model_specific_max_tokens_default() -> 
         caller=_DummyRoom().local_participant,
         toolkits=[],
         model="claude-opus-4-6",
+    )
+
+    assert result == "ok"
+    assert adapter.requests[0]["max_tokens"] == 128_000
+
+
+@pytest.mark.asyncio
+async def test_next_uses_higher_opus_4_7_model_specific_max_tokens_default() -> None:
+    adapter = _FakeAdapter(
+        responses=[{"content": [{"type": "text", "text": "ok"}]}],
+        model="claude-3-5-sonnet-latest",
+    )
+    context = AgentSessionContext(system_role=None)
+    context.append_user_message("hello")
+
+    result = await adapter.next(
+        context=context,
+        caller=_DummyRoom().local_participant,
+        toolkits=[],
+        model="claude-opus-4-7",
     )
 
     assert result == "ok"
