@@ -135,7 +135,7 @@ def _transform_strict_anthropic_schema(schema: dict[str, Any]) -> dict[str, Any]
 
 def _default_max_tokens_for_model(model: str) -> int:
     normalized_model = model.strip().lower()
-    if normalized_model.startswith("claude-opus-4-6"):
+    if normalized_model.startswith(("claude-opus-4-7", "claude-opus-4-6")):
         return 128_000
     if normalized_model.startswith("claude-sonnet-4"):
         return 64_000
