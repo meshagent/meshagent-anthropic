@@ -51,6 +51,15 @@ class _DummyParticipant:
         return None
 
 
+class _NamelessParticipant:
+    def __init__(self):
+        self.id = "p2"
+
+    def get_attribute(self, name: str):
+        del name
+        return None
+
+
 class _DummyRoom:
     def __init__(self):
         self.local_participant = _DummyParticipant()
@@ -2298,6 +2307,27 @@ async def test_next_merges_header_betas_into_request_betas_for_web_fetch_compact
     extra_headers = request.get("extra_headers")
     if isinstance(extra_headers, dict):
         assert "anthropic-beta" not in extra_headers
+
+
+@pytest.mark.asyncio
+async def test_next_omits_on_behalf_of_header_when_name_is_missing() -> None:
+    adapter = _FakeAdapter(
+        responses=[{"content": [{"type": "text", "text": "ok"}]}],
+        model="claude-opus-4-6",
+    )
+    context = AgentSessionContext(system_role=None)
+    context.append_user_message("hello")
+
+    result = await adapter.next(
+        context=context,
+        caller=_DummyRoom().local_participant,
+        on_behalf_of=_NamelessParticipant(),
+        toolkits=[],
+    )
+
+    assert result == "ok"
+    assert len(adapter.requests) == 1
+    assert adapter.requests[0].get("extra_headers") is None
 
 
 @pytest.mark.asyncio

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from meshagent.agents.agent import AgentSessionContext
 from meshagent.api import Participant, RoomException
+from meshagent.api.http import normalize_extra_headers
 from meshagent.agents.event_publisher import (
     _AnthropicAgentEventPublisher,
     make_anthropic_agent_event_publisher,
@@ -1870,12 +1871,12 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
     def _apply_request_middleware(
         self, *, request: dict, middleware: list[BaseTool]
     ) -> dict:
-        headers = request.get("extra_headers") or {}
+        headers = normalize_extra_headers(request.get("extra_headers"))
         for m in middleware:
             if not isinstance(m, AnthropicRequestTool):
                 raise RoomException(f"unsupported request middleware type {type(m)}")
             m.apply(request=request, headers=headers)
-        request["extra_headers"] = headers or None
+        request["extra_headers"] = normalize_extra_headers(headers) or None
         return request
 
     def _resolve_tool_choice(
@@ -2001,9 +2002,9 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
 
                 extra_headers = {}
                 if on_behalf_of is not None:
-                    extra_headers["Meshagent-On-Behalf-Of"] = (
-                        on_behalf_of.get_attribute("name")
-                    )
+                    on_behalf_of_name = on_behalf_of.get_attribute("name")
+                    if isinstance(on_behalf_of_name, str):
+                        extra_headers["Meshagent-On-Behalf-Of"] = on_behalf_of_name
 
                 message_options = dict(self._message_options or {})
 
@@ -2043,6 +2044,9 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
                 self._add_auto_compaction_context_management(request=request)
                 self._ensure_context_management_betas(request=request)
                 self._normalize_request_betas(request=request)
+                request["extra_headers"] = (
+                    normalize_extra_headers(request.get("extra_headers")) or None
+                )
 
                 # Normalize empty lists to None for Anthropic.
                 if (
