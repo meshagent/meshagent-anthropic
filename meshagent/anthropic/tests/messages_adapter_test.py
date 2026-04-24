@@ -159,14 +159,18 @@ def test_anthropic_adapter_passes_base_url_to_get_client(monkeypatch) -> None:
     adapter = AnthropicMessagesAdapter(
         base_url="https://anthropic.example.test",
         api_key="test-token",
+        user_agent="custom-app/1.0",
     )
     fake_client = object()
     call_args: dict[str, object] = {}
 
-    def _fake_get_client(*, base_url=None, http_client=None, api_key=None):
+    def _fake_get_client(
+        *, base_url=None, http_client=None, api_key=None, user_agent=None
+    ):
         call_args["base_url"] = base_url
         call_args["http_client"] = http_client
         call_args["api_key"] = api_key
+        call_args["user_agent"] = user_agent
         return fake_client
 
     monkeypatch.setattr(
@@ -180,6 +184,7 @@ def test_anthropic_adapter_passes_base_url_to_get_client(monkeypatch) -> None:
     assert call_args["base_url"] == "https://anthropic.example.test"
     assert call_args["http_client"] is None
     assert call_args["api_key"] == "test-token"
+    assert call_args["user_agent"] == "custom-app/1.0"
 
 
 def test_anthropic_adapter_reads_base_url_from_environment(monkeypatch) -> None:

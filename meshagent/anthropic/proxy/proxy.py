@@ -4,6 +4,7 @@ import httpx
 import os
 from typing import Optional, Any
 from meshagent.api.urls import meshagent_base_url
+from meshagent.anthropic.version import __version__
 
 try:
     from anthropic import AsyncAnthropic
@@ -11,6 +12,7 @@ except Exception:  # pragma: no cover
     AsyncAnthropic = None  # type: ignore
 
 logger = logging.getLogger("anthropic.client")
+DEFAULT_USER_AGENT = f"meshagent/{__version__}"
 
 
 def _redact_headers(headers: httpx.Headers) -> dict:
@@ -80,11 +82,17 @@ def resolve_api_key(api_key: str | None = None) -> str | None:
     return resolved or None
 
 
+def resolve_user_agent(user_agent: str | None = None) -> str:
+    resolved = user_agent.strip() if isinstance(user_agent, str) else ""
+    return resolved or DEFAULT_USER_AGENT
+
+
 def get_client(
     *,
     base_url: str | None = None,
     http_client: Optional[httpx.AsyncClient] = None,
     api_key: str | None = None,
+    user_agent: str | None = None,
 ) -> Any:
     if AsyncAnthropic is None:  # pragma: no cover
         raise RuntimeError(
@@ -96,6 +104,7 @@ def get_client(
     if resolved_api_key is not None:
         kwargs["api_key"] = resolved_api_key
     kwargs["base_url"] = resolved_base_url
+    kwargs["default_headers"] = {"User-Agent": resolve_user_agent(user_agent)}
     if http_client is not None:
         kwargs["http_client"] = http_client
     return AsyncAnthropic(**kwargs)

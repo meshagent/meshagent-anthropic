@@ -46,6 +46,7 @@ from meshagent.anthropic.proxy import (
     get_logging_httpx_client,
     resolve_api_key,
     resolve_base_url,
+    resolve_user_agent,
 )
 from meshagent.anthropic.request_tool import AnthropicRequestTool
 from meshagent.anthropic.usage import (
@@ -891,6 +892,7 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
         *,
         base_url: str | None = None,
         api_key: str | None = None,
+        user_agent: str | None = None,
         max_tool_call_length: int = DEFAULT_MAX_TOOL_CALL_LENGTH,
         max_tool_call_lines: int = DEFAULT_MAX_TOOL_CALL_LINES,
     ):
@@ -917,6 +919,7 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
         self._base_url = resolve_base_url(base_url)
         self._has_explicit_api_key = isinstance(api_key, str) and api_key.strip() != ""
         self._api_key = resolve_api_key(api_key)
+        self._user_agent = resolve_user_agent(user_agent)
         self._message_options = message_options or {}
         self._provider = provider
         self._log_requests = log_requests
@@ -957,6 +960,7 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
             tool_calling_mode=self._tool_calling_state.mode,
             base_url=self._base_url,
             api_key=resolved_api_key,
+            user_agent=self._user_agent,
             max_tool_call_length=self._max_tool_call_length,
             max_tool_call_lines=self._max_tool_call_lines,
         )
@@ -1058,6 +1062,7 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
         return get_client(
             base_url=self._base_url,
             api_key=self._api_key,
+            user_agent=self._user_agent,
             http_client=http_client,
         )
 
