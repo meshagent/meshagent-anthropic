@@ -915,6 +915,7 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
         )
         self._client = client
         self._base_url = resolve_base_url(base_url)
+        self._has_explicit_api_key = isinstance(api_key, str) and api_key.strip() != ""
         self._api_key = resolve_api_key(api_key)
         self._message_options = message_options or {}
         self._provider = provider
@@ -930,6 +931,35 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
 
     def default_model(self) -> str:
         return self._model
+
+    def with_runtime_api_key(
+        self, *, api_key: str | None
+    ) -> "AnthropicMessagesAdapter":
+        resolved_api_key = resolve_api_key(api_key)
+        if (
+            self._client is not None
+            or self._has_explicit_api_key
+            or resolved_api_key is None
+        ):
+            return self
+
+        return type(self)(
+            model=self._model,
+            max_tokens=self._max_tokens,
+            max_retries=self._max_retries,
+            message_options=copy.deepcopy(self._message_options),
+            provider=self._provider,
+            log_requests=self._log_requests,
+            context_management=self._context_management_mode,
+            compaction_threshold=self._compaction_threshold,
+            compaction_pause_after=self._compaction_pause_after,
+            compaction_instructions=self._compaction_instructions,
+            tool_calling_mode=self._tool_calling_state.mode,
+            base_url=self._base_url,
+            api_key=resolved_api_key,
+            max_tool_call_length=self._max_tool_call_length,
+            max_tool_call_lines=self._max_tool_call_lines,
+        )
 
     def get_additional_instructions(self) -> str | None:
         return _ANTHROPIC_STEERING_INSTRUCTIONS

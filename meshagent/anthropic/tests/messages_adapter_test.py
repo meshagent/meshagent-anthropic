@@ -190,6 +190,40 @@ def test_anthropic_adapter_reads_base_url_from_environment(monkeypatch) -> None:
     assert adapter._base_url == "https://env.anthropic.example.test"
 
 
+def test_anthropic_adapter_with_runtime_api_key_returns_bound_clone(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "env-token")
+    adapter = AnthropicMessagesAdapter(
+        model="claude-sonnet-4-20250514",
+        message_options={"metadata": {"tag": "original"}},
+        tool_calling_mode="strict",
+    )
+
+    bound = adapter.with_runtime_api_key(api_key="runtime-token")
+
+    assert bound is not adapter
+    assert bound._api_key == "runtime-token"
+    assert bound._message_options == {"metadata": {"tag": "original"}}
+    assert bound._message_options is not adapter._message_options
+    assert bound._tool_calling_state.mode == "strict"
+
+    bound._message_options["metadata"]["tag"] = "updated"
+    assert adapter._message_options == {"metadata": {"tag": "original"}}
+
+
+def test_anthropic_adapter_with_runtime_api_key_keeps_explicit_api_key() -> None:
+    adapter = AnthropicMessagesAdapter(api_key="configured-token")
+
+    assert adapter.with_runtime_api_key(api_key="runtime-token") is adapter
+
+
+def test_anthropic_adapter_with_runtime_api_key_keeps_explicit_client() -> None:
+    adapter = AnthropicMessagesAdapter(client=object())
+
+    assert adapter.with_runtime_api_key(api_key="runtime-token") is adapter
+
+
 class _AnyArgsTool(FunctionTool):
     def __init__(self, name: str):
         super().__init__(
