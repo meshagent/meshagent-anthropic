@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from meshagent.agents.agent import AgentSessionContext
 from meshagent.api import Participant, RoomException
-from meshagent.api.http import normalize_extra_headers
+from meshagent.api.http import (
+    llm_annotation_headers,
+    normalize_extra_headers,
+    normalize_llm_annotations,
+)
 from meshagent.agents.event_publisher import (
     _AnthropicAgentEventPublisher,
     make_anthropic_agent_event_publisher,
@@ -30,7 +34,7 @@ from meshagent.agents.adapter import (
 
 import json
 from typing import Any, Optional, Callable, Literal
-from collections.abc import AsyncIterable
+from collections.abc import AsyncIterable, Mapping
 import os
 import logging
 import re
@@ -894,6 +898,7 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
         base_url: str | None = None,
         api_key: str | None = None,
         user_agent: str | None = None,
+        annotations: Mapping[str, object] | None = None,
         max_tool_call_length: int = DEFAULT_MAX_TOOL_CALL_LENGTH,
         max_tool_call_lines: int = DEFAULT_MAX_TOOL_CALL_LINES,
     ):
@@ -921,6 +926,7 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
         self._has_explicit_api_key = isinstance(api_key, str) and api_key.strip() != ""
         self._api_key = resolve_api_key(api_key)
         self._user_agent = resolve_user_agent(user_agent)
+        self._annotations = normalize_llm_annotations(annotations)
         self._message_options = message_options or {}
         self._provider = provider
         self._log_requests = log_requests
@@ -962,6 +968,7 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
             base_url=self._base_url,
             api_key=resolved_api_key,
             user_agent=self._user_agent,
+            annotations=self._annotations,
             max_tool_call_length=self._max_tool_call_length,
             max_tool_call_lines=self._max_tool_call_lines,
         )
@@ -1814,6 +1821,7 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
                     model=model,
                     provider="anthropic",
                     tokens=flattened_usage,
+                    annotations=self._annotations,
                 )
         context_management = response.get("context_management")
         if isinstance(context_management, dict):
@@ -2041,7 +2049,7 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
 
                 messages, system = self._convert_messages(context=context)
 
-                extra_headers = {}
+                extra_headers = llm_annotation_headers(self._annotations)
                 if on_behalf_of is not None:
                     on_behalf_of_name = on_behalf_of.get_attribute("name")
                     if isinstance(on_behalf_of_name, str):
@@ -2077,6 +2085,12 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
                             ),
                         }
                     }
+
+                merged_extra_headers = llm_annotation_headers(self._annotations)
+                merged_extra_headers.update(
+                    normalize_extra_headers(request.get("extra_headers"))
+                )
+                request["extra_headers"] = merged_extra_headers or None
 
                 request = self._apply_request_middleware(
                     request=request,

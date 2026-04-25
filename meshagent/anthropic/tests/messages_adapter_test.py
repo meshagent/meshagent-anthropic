@@ -65,16 +65,31 @@ def test_store_usage_publishes_otel_usage_metrics(monkeypatch: pytest.MonkeyPatc
     calls: list[dict[str, object]] = []
 
     def _fake_track_otel_usage_metrics(
-        *, model: str, provider: str, tokens: dict[str, float]
+        *,
+        model: str,
+        provider: str,
+        tokens: dict[str, float],
+        annotations: dict[str, str] | None = None,
     ) -> None:
-        calls.append({"model": model, "provider": provider, "tokens": tokens})
+        calls.append(
+            {
+                "model": model,
+                "provider": provider,
+                "tokens": tokens,
+                "annotations": annotations,
+            }
+        )
 
     monkeypatch.setattr(
         messages_adapter_module,
         "track_otel_usage_metrics",
         _fake_track_otel_usage_metrics,
     )
-    adapter = AnthropicMessagesAdapter(model="claude-sonnet-4-6", client=object())
+    adapter = AnthropicMessagesAdapter(
+        model="claude-sonnet-4-6",
+        client=object(),
+        annotations={"Env": "prod"},
+    )
     context = AgentSessionContext(system_role=None)
 
     adapter._store_usage(
@@ -88,6 +103,7 @@ def test_store_usage_publishes_otel_usage_metrics(monkeypatch: pytest.MonkeyPatc
             "model": "claude-sonnet-4-6",
             "provider": "anthropic",
             "tokens": {"input_tokens": 10.0, "output_tokens": 5.0},
+            "annotations": {"env": "prod"},
         }
     ]
 
