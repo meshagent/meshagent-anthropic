@@ -53,6 +53,7 @@ from meshagent.anthropic.usage import (
     add_usage_metrics,
     normalize_anthropic_usage,
     preprocess_anthropic_usage,
+    track_otel_usage_metrics,
 )
 from meshagent.tools.strict_schema import ensure_strict_json_schema
 
@@ -1809,6 +1810,11 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
             flattened_usage = preprocess_anthropic_usage(model=model, usage=usage)
             if flattened_usage is not None:
                 add_usage_metrics(totals=context.usage, usage=flattened_usage)
+                track_otel_usage_metrics(
+                    model=model,
+                    provider="anthropic",
+                    tokens=flattened_usage,
+                )
         context_management = response.get("context_management")
         if isinstance(context_management, dict):
             context.metadata["last_context_management"] = context_management

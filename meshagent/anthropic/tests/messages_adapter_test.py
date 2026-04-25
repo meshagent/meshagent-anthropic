@@ -25,6 +25,7 @@ from meshagent.agents.event_publisher import (
     _AgentMessageEmitter,
     _AnthropicAgentEventPublisher,
 )
+import meshagent.anthropic.messages_adapter as messages_adapter_module
 from meshagent.anthropic.messages_adapter import (
     AnthropicMessagesAdapter,
     AnthropicMessagesToolResponseAdapter,
@@ -58,6 +59,37 @@ class _NamelessParticipant:
     def get_attribute(self, name: str):
         del name
         return None
+
+
+def test_store_usage_publishes_otel_usage_metrics(monkeypatch: pytest.MonkeyPatch):
+    calls: list[dict[str, object]] = []
+
+    def _fake_track_otel_usage_metrics(
+        *, model: str, provider: str, tokens: dict[str, float]
+    ) -> None:
+        calls.append({"model": model, "provider": provider, "tokens": tokens})
+
+    monkeypatch.setattr(
+        messages_adapter_module,
+        "track_otel_usage_metrics",
+        _fake_track_otel_usage_metrics,
+    )
+    adapter = AnthropicMessagesAdapter(model="claude-sonnet-4-6", client=object())
+    context = AgentSessionContext(system_role=None)
+
+    adapter._store_usage(
+        context=context,
+        response={"usage": {"input_tokens": 10, "output_tokens": 5}},
+        model="claude-sonnet-4-6",
+    )
+
+    assert calls == [
+        {
+            "model": "claude-sonnet-4-6",
+            "provider": "anthropic",
+            "tokens": {"input_tokens": 10.0, "output_tokens": 5.0},
+        }
+    ]
 
 
 class _DummyRoom:
