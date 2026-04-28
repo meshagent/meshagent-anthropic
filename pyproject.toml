@@ -13,9 +13,9 @@ dependencies = [
   "pytest~=8.4",
   "pytest-asyncio~=0.26",
   "opentelemetry-distro~=0.59b0",
-  "meshagent-api==0.38.4",
-  "meshagent-agents==0.38.4",
-  "meshagent-tools==0.38.4",
+  "meshagent-api==0.39.0",
+  "meshagent-agents==0.39.0",
+  "meshagent-tools==0.39.0",
   "anthropic~=0.78.0",
   "html-to-markdown~=2.24.3",
 ]
