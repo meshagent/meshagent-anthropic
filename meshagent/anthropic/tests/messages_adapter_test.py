@@ -2911,23 +2911,31 @@ def test_make_agent_event_publisher_emits_native_anthropic_messages() -> None:
 
     function_pending = published[9]
     assert isinstance(function_pending, AgentToolCallPending)
+    assert function_pending.namespace == "meshagent"
+    assert function_pending.call_id == "toolu_1"
     assert function_pending.toolkit == "function"
     assert function_pending.tool == "lookup"
     assert function_pending.arguments == {"q": "meshagent"}
 
     function_started = published[10]
     assert isinstance(function_started, AgentToolCallStarted)
+    assert function_started.namespace == "meshagent"
+    assert function_started.call_id == "toolu_1"
     assert function_started.toolkit == "function"
     assert function_started.tool == "lookup"
     assert function_started.arguments == {"q": "meshagent"}
 
     mcp_pending = published[12]
     assert isinstance(mcp_pending, AgentToolCallPending)
+    assert mcp_pending.namespace == "anthropic.messages"
+    assert mcp_pending.call_id == "mcpu_1"
     assert mcp_pending.toolkit == "deepwiki"
     assert mcp_pending.tool == "search"
 
     mcp_started = published[13]
     assert isinstance(mcp_started, AgentToolCallStarted)
+    assert mcp_started.namespace == "anthropic.messages"
+    assert mcp_started.call_id == "mcpu_1"
     assert mcp_started.toolkit == "deepwiki"
     assert mcp_started.tool == "search"
 
