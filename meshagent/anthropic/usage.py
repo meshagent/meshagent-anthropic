@@ -8,6 +8,14 @@ from pydantic import BaseModel
 
 logger = logging.getLogger("anthropic_agent")
 _usage_meters: dict[str, object] = {}
+_BILLABLE_USAGE_KEYS = frozenset(
+    {
+        "input_tokens",
+        "output_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+    }
+)
 
 
 def _to_float(value: Any) -> float | None:
@@ -104,13 +112,13 @@ def preprocess_anthropic_usage(
     if not isinstance(usage, dict):
         return None
 
-    usage_copy = {**usage}
-
-    service_tier = usage_copy.pop("service_tier", None)
+    service_tier = usage.get("service_tier")
     if service_tier is not None and service_tier != "standard":
         logger.warning("custom pricing tier is in use, ignoring custom tier")
 
-    flattened = _flatten_usage(usage_copy)
+    flattened = _flatten_usage(
+        {key: value for key, value in usage.items() if key in _BILLABLE_USAGE_KEYS}
+    )
     return split_anthropic_usage_by_tier(model=model, usage=flattened)
 
 

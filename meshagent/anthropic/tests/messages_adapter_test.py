@@ -106,6 +106,51 @@ def test_store_usage_publishes_otel_usage_metrics(monkeypatch: pytest.MonkeyPatc
             "annotations": {"env": "prod"},
         }
     ]
+    assert context.metadata["last_response_flattened_usage"] == {
+        "input_tokens": 10.0,
+        "output_tokens": 5.0,
+    }
+    assert context.metadata["last_response_context_used_tokens"] == 15
+
+
+def test_store_usage_tracks_prompt_cache_usage() -> None:
+    adapter = AnthropicMessagesAdapter(
+        model="claude-sonnet-4-6",
+        client=object(),
+    )
+    context = AgentSessionContext(system_role=None)
+
+    adapter._store_usage(
+        context=context,
+        response={
+            "usage": {
+                "cache_creation": {
+                    "ephemeral_1h_input_tokens": 0,
+                    "ephemeral_5m_input_tokens": 1000,
+                },
+                "input_tokens": 100,
+                "cache_creation_input_tokens": 1000,
+                "cache_read_input_tokens": 900,
+                "output_tokens": 5,
+                "service_tier": "standard",
+            }
+        },
+        model="claude-sonnet-4-6",
+    )
+
+    assert context.metadata["last_response_flattened_usage"] == {
+        "input_tokens": 100.0,
+        "cache_creation_input_tokens": 1000.0,
+        "cache_read_input_tokens": 900.0,
+        "output_tokens": 5.0,
+    }
+    assert context.metadata["last_response_context_used_tokens"] == 2005
+    assert context.usage == {
+        "input_tokens": 100.0,
+        "cache_creation_input_tokens": 1000.0,
+        "cache_read_input_tokens": 900.0,
+        "output_tokens": 5.0,
+    }
 
 
 class _DummyRoom:
@@ -2474,6 +2519,11 @@ async def test_next_stores_usage_metadata() -> None:
     assert context.metadata["last_response_model"] == adapter.default_model()
     assert context.metadata["last_response_usage"]["input_tokens"] == 10
     assert context.metadata["last_response_usage"]["output_tokens"] == 5
+    assert context.metadata["last_response_flattened_usage"] == {
+        "input_tokens": 10.0,
+        "output_tokens": 5.0,
+    }
+    assert context.metadata["last_response_context_used_tokens"] == 15
     assert context.usage == {
         "input_tokens": 10.0,
         "output_tokens": 5.0,
@@ -2495,6 +2545,8 @@ async def test_next_stores_usage_for_streaming_response(monkeypatch) -> None:
             "content": [{"type": "text", "text": "ok"}],
             "usage": {
                 "input_tokens": 7,
+                "cache_creation_input_tokens": 1000,
+                "cache_read_input_tokens": 900,
                 "output_tokens": 4,
             },
         }
@@ -2512,8 +2564,17 @@ async def test_next_stores_usage_for_streaming_response(monkeypatch) -> None:
     assert events[0]["type"] == "message.delta"
     assert context.turn_count == 1
     assert context.metadata["last_response_usage"]["input_tokens"] == 7
+    assert context.metadata["last_response_flattened_usage"] == {
+        "input_tokens": 7.0,
+        "cache_creation_input_tokens": 1000.0,
+        "cache_read_input_tokens": 900.0,
+        "output_tokens": 4.0,
+    }
+    assert context.metadata["last_response_context_used_tokens"] == 1911
     assert context.usage == {
         "input_tokens": 7.0,
+        "cache_creation_input_tokens": 1000.0,
+        "cache_read_input_tokens": 900.0,
         "output_tokens": 4.0,
     }
 

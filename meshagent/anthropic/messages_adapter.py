@@ -1816,6 +1816,12 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
 
             flattened_usage = preprocess_anthropic_usage(model=model, usage=usage)
             if flattened_usage is not None:
+                context.metadata["last_response_flattened_usage"] = dict(
+                    flattened_usage
+                )
+                context.metadata["last_response_context_used_tokens"] = (
+                    self._context_used_tokens_from_usage(flattened_usage)
+                )
                 add_usage_metrics(totals=context.usage, usage=flattened_usage)
                 track_otel_usage_metrics(
                     model=model,
@@ -1826,6 +1832,23 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
         context_management = response.get("context_management")
         if isinstance(context_management, dict):
             context.metadata["last_context_management"] = context_management
+
+    @staticmethod
+    def _context_used_tokens_from_usage(usage: dict[str, float]) -> int:
+        total = 0.0
+        for key, value in usage.items():
+            if key in {
+                "input_tokens",
+                "output_tokens",
+                "cache_creation_input_tokens",
+                "cache_read_input_tokens",
+                "input_tokens_long",
+                "output_tokens_long",
+                "cache_creation_input_tokens_long",
+                "cache_read_input_tokens_long",
+            }:
+                total += float(value)
+        return max(0, int(total))
 
     async def get_input_tokens(
         self,
