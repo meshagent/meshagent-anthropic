@@ -942,6 +942,9 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
     def default_model(self) -> str:
         return self._model
 
+    def provider_name(self) -> str | None:
+        return self._provider
+
     def with_runtime_api_key(
         self, *, api_key: str | None
     ) -> "AnthropicMessagesAdapter":
