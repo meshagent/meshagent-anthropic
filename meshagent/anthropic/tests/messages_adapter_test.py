@@ -16,6 +16,7 @@ from meshagent.agents.messages import (
     AgentTextContentDelta,
     AgentTextContentEnded,
     AgentTextContentStarted,
+    AgentToolCallArgumentsDelta,
     AgentToolCallLogDelta,
     AgentToolCallPending,
     AgentToolCallEnded,
@@ -2947,9 +2948,11 @@ def test_make_agent_event_publisher_emits_native_anthropic_messages() -> None:
         AgentFileContentDelta,
         AgentFileContentEnded,
         AgentToolCallPending,
+        AgentToolCallArgumentsDelta,
         AgentToolCallStarted,
         AgentToolCallEnded,
         AgentToolCallPending,
+        AgentToolCallArgumentsDelta,
         AgentToolCallStarted,
         AgentToolCallEnded,
     ]
@@ -2978,7 +2981,13 @@ def test_make_agent_event_publisher_emits_native_anthropic_messages() -> None:
     assert function_pending.tool == "lookup"
     assert function_pending.arguments == {"q": "meshagent"}
 
-    function_started = published[10]
+    function_delta = published[10]
+    assert isinstance(function_delta, AgentToolCallArgumentsDelta)
+    assert function_delta.delta == '{"q":"meshagent"}'
+    assert "toolkit" not in function_delta.model_dump()
+    assert "tool" not in function_delta.model_dump()
+
+    function_started = published[11]
     assert isinstance(function_started, AgentToolCallStarted)
     assert function_started.namespace == "meshagent"
     assert function_started.call_id == "toolu_1"
@@ -2986,14 +2995,20 @@ def test_make_agent_event_publisher_emits_native_anthropic_messages() -> None:
     assert function_started.tool == "lookup"
     assert function_started.arguments == {"q": "meshagent"}
 
-    mcp_pending = published[12]
+    mcp_pending = published[13]
     assert isinstance(mcp_pending, AgentToolCallPending)
     assert mcp_pending.namespace == "anthropic.messages"
     assert mcp_pending.call_id == "mcpu_1"
     assert mcp_pending.toolkit == "deepwiki"
     assert mcp_pending.tool == "search"
 
-    mcp_started = published[13]
+    mcp_delta = published[14]
+    assert isinstance(mcp_delta, AgentToolCallArgumentsDelta)
+    assert mcp_delta.delta == '{"query":"meshagent"}'
+    assert "toolkit" not in mcp_delta.model_dump()
+    assert "tool" not in mcp_delta.model_dump()
+
+    mcp_started = published[15]
     assert isinstance(mcp_started, AgentToolCallStarted)
     assert mcp_started.namespace == "anthropic.messages"
     assert mcp_started.call_id == "mcpu_1"
@@ -3129,17 +3144,180 @@ def test_make_agent_event_publisher_preserves_anthropic_tool_json_delta_whitespa
 
     assert [type(event) for event in published] == [
         AgentToolCallPending,
+        AgentToolCallArgumentsDelta,
+        AgentToolCallArgumentsDelta,
+        AgentToolCallPending,
+        AgentToolCallArgumentsDelta,
+        AgentToolCallStarted,
+        AgentToolCallEnded,
+    ]
+    first_delta = published[1]
+    assert isinstance(first_delta, AgentToolCallArgumentsDelta)
+    assert first_delta.delta == '{"q":"hello'
+    assert "toolkit" not in first_delta.model_dump()
+    assert "tool" not in first_delta.model_dump()
+    second_delta = published[2]
+    assert isinstance(second_delta, AgentToolCallArgumentsDelta)
+    assert second_delta.delta == ' world"}'
+    updated_pending = published[3]
+    assert isinstance(updated_pending, AgentToolCallPending)
+    assert updated_pending.arguments == {"q": "hello world"}
+    fallback_delta = published[4]
+    assert isinstance(fallback_delta, AgentToolCallArgumentsDelta)
+    assert fallback_delta.delta == '{"q":"hello world"}'
+    assert "toolkit" not in fallback_delta.model_dump()
+    assert "tool" not in fallback_delta.model_dump()
+    updated_started = published[5]
+    assert isinstance(updated_started, AgentToolCallStarted)
+    assert updated_started.arguments == {"q": "hello world"}
+    assert isinstance(published[-1], AgentToolCallEnded)
+
+
+@pytest.mark.parametrize(
+    ("content_block", "handler_item", "namespace", "toolkit", "tool"),
+    [
+        (
+            {"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": None},
+            {
+                "type": "function_call",
+                "id": "toolu_1",
+                "call_id": "toolu_1",
+                "name": "lookup",
+                "arguments": '{"q":"meshagent"}',
+            },
+            "meshagent",
+            "function",
+            "lookup",
+        ),
+        (
+            {
+                "type": "mcp_tool_use",
+                "id": "mcpu_1",
+                "server_name": "deepwiki",
+                "name": "search",
+                "input": None,
+            },
+            {
+                "type": "mcp_call",
+                "id": "mcpu_1",
+                "call_id": "mcpu_1",
+                "server_label": "deepwiki",
+                "name": "search",
+                "arguments": {"q": "meshagent"},
+            },
+            "anthropic.messages",
+            "deepwiki",
+            "search",
+        ),
+        (
+            {
+                "type": "web_search_tool_use",
+                "id": "webu_1",
+                "query": "meshagent",
+            },
+            {
+                "type": "web_search_tool_use",
+                "id": "webu_1",
+                "query": "meshagent",
+            },
+            "anthropic.messages",
+            "anthropic",
+            "web_search",
+        ),
+    ],
+)
+def test_make_agent_event_publisher_normalizes_anthropic_builtin_tool_lifecycle(
+    content_block: dict[str, Any],
+    handler_item: dict[str, Any],
+    namespace: str,
+    toolkit: str,
+    tool: str,
+) -> None:
+    published: list[object] = []
+    publisher = _AnthropicAgentEventPublisher(
+        emitter=_AgentMessageEmitter(
+            turn_id="turn-1",
+            thread_id="thread-1",
+            callback=published.append,
+        )
+    )
+
+    publisher({"type": "message_start", "event": {"message": {"id": "msg_1"}}})
+    publisher(
+        {
+            "type": "content_block_start",
+            "event": {"index": 0, "content_block": content_block},
+        }
+    )
+    publisher(
+        {
+            "type": "content_block_delta",
+            "event": {
+                "index": 0,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": '{"q":"mesh',
+                },
+            },
+        }
+    )
+    publisher(
+        {
+            "type": "content_block_delta",
+            "event": {
+                "index": 0,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": 'agent"}',
+                },
+            },
+        }
+    )
+    publisher({"type": "content_block_stop", "event": {"index": 0}})
+    publisher({"type": "meshagent.handler.added", "item": handler_item})
+    publisher({"type": "meshagent.handler.done", "item_id": content_block["id"]})
+
+    expected_types = [
+        AgentToolCallPending,
+        AgentToolCallArgumentsDelta,
+        AgentToolCallArgumentsDelta,
         AgentToolCallPending,
         AgentToolCallStarted,
         AgentToolCallEnded,
     ]
-    updated_pending = published[1]
+    if content_block["type"] in {"tool_use", "mcp_tool_use"}:
+        expected_types.insert(4, AgentToolCallArgumentsDelta)
+
+    assert [type(event) for event in published] == expected_types
+    first_pending = published[0]
+    assert isinstance(first_pending, AgentToolCallPending)
+    assert first_pending.namespace == namespace
+    assert first_pending.toolkit == toolkit
+    assert first_pending.tool == tool
+    first_delta = published[1]
+    assert isinstance(first_delta, AgentToolCallArgumentsDelta)
+    assert first_delta.delta == '{"q":"mesh'
+    assert "toolkit" not in first_delta.model_dump()
+    assert "tool" not in first_delta.model_dump()
+    updated_pending = published[3]
     assert isinstance(updated_pending, AgentToolCallPending)
-    assert updated_pending.arguments == {"q": "hello world"}
-    updated_started = published[2]
-    assert isinstance(updated_started, AgentToolCallStarted)
-    assert updated_started.arguments == {"q": "hello world"}
-    assert isinstance(published[-1], AgentToolCallEnded)
+    assert updated_pending.arguments == {"q": "meshagent"}
+    started_index = 4
+    if content_block["type"] in {"tool_use", "mcp_tool_use"}:
+        fallback_delta = published[4]
+        assert isinstance(fallback_delta, AgentToolCallArgumentsDelta)
+        assert fallback_delta.delta == '{"q":"meshagent"}'
+        assert "toolkit" not in fallback_delta.model_dump()
+        assert "tool" not in fallback_delta.model_dump()
+        started_index = 5
+    started = published[started_index]
+    assert isinstance(started, AgentToolCallStarted)
+    assert started.toolkit == toolkit
+    assert started.tool == tool
+    ended = published[started_index + 1]
+    assert isinstance(ended, AgentToolCallEnded)
+    assert ended.toolkit == toolkit
+    assert ended.tool == tool
 
 
 def test_make_agent_event_publisher_unmangles_function_tool_names_from_tool_bundle():
@@ -3193,6 +3371,7 @@ def test_make_agent_event_publisher_unmangles_function_tool_names_from_tool_bund
 
     assert [type(event) for event in published] == [
         AgentToolCallPending,
+        AgentToolCallArgumentsDelta,
         AgentToolCallStarted,
         AgentToolCallEnded,
     ]
@@ -3202,7 +3381,13 @@ def test_make_agent_event_publisher_unmangles_function_tool_names_from_tool_bund
     assert pending.tool == "lookup/web"
     assert pending.arguments == {"q": "meshagent"}
 
-    started = published[1]
+    delta = published[1]
+    assert isinstance(delta, AgentToolCallArgumentsDelta)
+    assert delta.delta == '{"q":"meshagent"}'
+    assert "toolkit" not in delta.model_dump()
+    assert "tool" not in delta.model_dump()
+
+    started = published[2]
     assert isinstance(started, AgentToolCallStarted)
     assert started.toolkit == "search"
     assert started.tool == "lookup/web"
@@ -3256,6 +3441,7 @@ def test_make_agent_event_publisher_marks_anthropic_tool_failure() -> None:
 
     assert [type(event) for event in published] == [
         AgentToolCallPending,
+        AgentToolCallArgumentsDelta,
         AgentToolCallStarted,
         AgentToolCallEnded,
     ]
