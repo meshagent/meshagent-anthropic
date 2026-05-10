@@ -7,7 +7,7 @@ from meshagent.api.http import (
     normalize_extra_headers,
     normalize_llm_annotations,
 )
-from meshagent.agents.event_publisher import (
+from meshagent.anthropic.event_publisher import (
     _AnthropicAgentEventPublisher,
     make_anthropic_agent_event_publisher,
 )
@@ -29,7 +29,15 @@ from meshagent.agents.adapter import (
     DEFAULT_MAX_TOOL_CALL_LINES,
     ToolResponseAdapter,
     LLMAdapter,
+    LLMModelInfo,
     SteeringCallback,
+    llm_model_pricing,
+)
+from meshagent.agents.agent_event_reader import (
+    AccumulatingAgentEventReader,
+    AgentEventReader,
+    AgentEventReaderCallbacks,
+    _BufferedToolCall,
 )
 
 import json
@@ -618,6 +626,164 @@ class AnthropicMessagesChatContext(AgentSessionContext):
         return message
 
 
+class AnthropicMessagesAgentEventReader(AccumulatingAgentEventReader):
+    def _append_user_text(self, text: str) -> None:
+        self._emit_context_message({"role": "user", "content": [_text_block(text)]})
+
+    def _append_user_content(self, content: list[dict[str, Any]]) -> None:
+        blocks: list[dict[str, Any]] = []
+        for item in content:
+            item_type = item.get("type")
+            if item_type == "text":
+                text = item.get("text")
+                if isinstance(text, str):
+                    blocks.append(_text_block(text))
+            elif item_type == "file":
+                url = item.get("url")
+                if isinstance(url, str):
+                    blocks.append(_text_block(f"the user attached a file: {url}"))
+        if not blocks:
+            blocks.append(_text_block(json.dumps(content)))
+        self._emit_context_message({"role": "user", "content": blocks})
+
+    def _append_assistant_text(self, *, text: str, phase: str | None) -> None:
+        del phase
+        self._emit_context_message(
+            {"role": "assistant", "content": [_text_block(text)]}
+        )
+
+    def _append_assistant_reasoning(self, *, text: str) -> None:
+        self._emit_context_message(
+            {"role": "assistant", "content": [_text_block(f"Reasoning: {text}")]}
+        )
+
+    def _append_assistant_file(self, *, url: str) -> None:
+        self._emit_context_message(
+            {"role": "assistant", "content": [_text_block(f"Generated file: {url}")]}
+        )
+
+    def _append_thread_event(self, *, event: dict[str, Any]) -> None:
+        self._emit_context_message(
+            {
+                "role": "assistant",
+                "content": [_text_block(json.dumps({"type": "event", "event": event}))],
+            }
+        )
+
+    def _append_tool_call(
+        self,
+        *,
+        tool_call: _BufferedToolCall,
+        result: dict[str, Any] | None,
+        error: dict[str, Any] | None,
+    ) -> None:
+        block = self._tool_use_block(tool_call=tool_call)
+        self._emit_context_message({"role": "assistant", "content": [block]})
+        if result is not None or error is not None or tool_call.logs:
+            self._emit_context_message(
+                _tool_result_message(
+                    tool_use_id=tool_call.call_id or tool_call.item_id,
+                    content=[
+                        _text_block(
+                            self._result_text(
+                                result=result,
+                                error=error,
+                                logs=tool_call.logs,
+                            )
+                        )
+                    ],
+                )
+            )
+
+    def _append_image_generation_event(
+        self,
+        *,
+        event_type: str,
+        item_id: str,
+        call_id: str | None,
+        toolkit: str,
+        tool: str,
+        arguments: dict[str, Any] | None,
+        images: list[dict[str, Any]],
+        status: str,
+        status_detail: str | None,
+    ) -> None:
+        item = {
+            "type": "image_generation",
+            "event_type": event_type,
+            "item_id": item_id,
+            "call_id": call_id,
+            "toolkit": toolkit,
+            "tool": tool,
+            "arguments": arguments,
+            "images": images,
+            "status": status,
+            "status_detail": status_detail,
+        }
+        self._emit_context_message(
+            {"role": "assistant", "content": [_text_block(json.dumps(item))]}
+        )
+
+    def _append_audio_generation_event(self, *, message: Any) -> None:
+        self._emit_context_message(
+            {
+                "role": "assistant",
+                "content": [_text_block(json.dumps(message.model_dump(mode="json")))],
+            }
+        )
+
+    def _append_audio_transcription_event(self, *, message: Any) -> None:
+        self._emit_context_message(
+            {
+                "role": "assistant",
+                "content": [_text_block(json.dumps(message.model_dump(mode="json")))],
+            }
+        )
+
+    def _restore_compacted_messages(self, *, messages: list[dict[str, Any]]) -> None:
+        for message in messages:
+            self._emit_context_message(message)
+
+    @staticmethod
+    def _tool_use_block(*, tool_call: _BufferedToolCall) -> dict[str, Any]:
+        tool_use_id = tool_call.call_id or tool_call.item_id
+        if tool_call.namespace == "anthropic.messages":
+            if tool_call.toolkit == "anthropic":
+                return {
+                    "type": f"{tool_call.tool}_tool_use",
+                    "id": tool_use_id,
+                    **tool_call.arguments_dict(),
+                }
+            return {
+                "type": "mcp_tool_use",
+                "id": tool_use_id,
+                "server_name": tool_call.toolkit,
+                "name": tool_call.tool,
+                "input": tool_call.arguments_dict(),
+            }
+        return {
+            "type": "tool_use",
+            "id": tool_use_id,
+            "name": AnthropicMessagesAgentEventReader._function_name(
+                tool_call=tool_call
+            ),
+            "input": tool_call.arguments_dict(),
+        }
+
+    @staticmethod
+    def _function_name(*, tool_call: _BufferedToolCall) -> str:
+        if tool_call.namespace == "openai.responses":
+            provider_tool = (
+                f"{tool_call.tool}_call"
+                if tool_call.toolkit == "openai"
+                else f"mcp_{tool_call.tool}"
+            )
+            return safe_tool_name(provider_tool)
+        if tool_call.toolkit in {"", "function", "tool"}:
+            return safe_tool_name(tool_call.tool)
+        return safe_tool_name(f"{tool_call.toolkit}_{tool_call.tool}")
+
+
 class MessagesToolBundle:
     def __init__(
         self,
@@ -880,6 +1046,14 @@ class AnthropicMessagesToolResponseAdapter(ToolResponseAdapter):
 
 
 class AnthropicMessagesAdapter(LLMAdapter[dict]):
+    _known_models = (
+        "claude-opus-4-5",
+        "claude-sonnet-4-5",
+        "claude-haiku-4-5",
+        "claude-3-5-sonnet-latest",
+        "claude-3-5-haiku-latest",
+    )
+
     def __init__(
         self,
         model: str = os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-latest"),
@@ -901,6 +1075,9 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
         annotations: Mapping[str, object] | None = None,
         max_tool_call_length: int = DEFAULT_MAX_TOOL_CALL_LENGTH,
         max_tool_call_lines: int = DEFAULT_MAX_TOOL_CALL_LINES,
+        friendly_name: str | None = None,
+        description: str | None = None,
+        allowed_models: list[str] | None = None,
     ):
         if context_management not in ("auto", "none"):
             raise ValueError("context_management must be one of 'auto' or 'none'")
@@ -938,12 +1115,34 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
         self._max_tool_call_lines = max_tool_call_lines
         self._max_retries = max_retries
         self._tool_calling_state = _AnthropicToolCallingState(mode=tool_calling_mode)
+        self._friendly_name = friendly_name
+        self._description = description
+        self._allowed_models = list(allowed_models) if allowed_models is not None else None
 
     def default_model(self) -> str:
         return self._model
 
     def provider_name(self) -> str | None:
         return self._provider
+
+    def provider_friendly_name(self) -> str:
+        return self._friendly_name or "Anthropic"
+
+    def provider_description(self) -> str | None:
+        return self._description or "Anthropic Messages API"
+
+    def list_models(self) -> list[LLMModelInfo]:
+        names = list(self._allowed_models or self._known_models)
+        if self._allowed_models is None and self._model not in names:
+            names.insert(0, self._model)
+        return [
+            LLMModelInfo(
+                name=name,
+                context_window=int(self.context_window_size(name)),
+                pricing=llm_model_pricing(provider="anthropic", model=name),
+            )
+            for name in names
+        ]
 
     def with_runtime_api_key(
         self, *, api_key: str | None
@@ -974,6 +1173,9 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
             annotations=self._annotations,
             max_tool_call_length=self._max_tool_call_length,
             max_tool_call_lines=self._max_tool_call_lines,
+            friendly_name=self._friendly_name,
+            description=self._description,
+            allowed_models=self._allowed_models,
         )
 
     def get_additional_instructions(self) -> str | None:
@@ -1036,6 +1238,17 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
 
     def create_session(self) -> AgentSessionContext:
         return AnthropicMessagesChatContext(system_role=None)
+
+    def make_agent_event_reader(
+        self,
+        *,
+        emit_message: Callable[[dict[str, Any]], None],
+        callbacks: AgentEventReaderCallbacks | None = None,
+    ) -> AgentEventReader:
+        return AnthropicMessagesAgentEventReader(
+            emit_message=emit_message,
+            callbacks=callbacks,
+        )
 
     def _make_tool_response_adapter(self) -> AnthropicMessagesToolResponseAdapter:
         return AnthropicMessagesToolResponseAdapter(
@@ -1999,7 +2212,7 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
             "disable_parallel_tool_use": True,
         }
 
-    async def next(
+    async def create_response(
         self,
         *,
         context: AgentSessionContext,

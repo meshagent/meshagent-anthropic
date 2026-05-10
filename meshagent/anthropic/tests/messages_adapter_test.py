@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import json
 import logging
 import pytest
 from typing import Any
@@ -7,6 +8,11 @@ import httpx
 from anthropic import APIConnectionError, APIStatusError
 
 from meshagent.agents.messages import (
+    AGENT_EVENT_TEXT_CONTENT_DELTA,
+    AGENT_EVENT_TEXT_CONTENT_ENDED,
+    AGENT_EVENT_TOOL_CALL_ARGUMENTS_DELTA,
+    AGENT_EVENT_TOOL_CALL_ENDED,
+    AGENT_EVENT_TOOL_CALL_STARTED,
     AgentFileContentDelta,
     AgentFileContentEnded,
     AgentFileContentStarted,
@@ -22,10 +28,8 @@ from meshagent.agents.messages import (
     AgentToolCallEnded,
     AgentToolCallStarted,
 )
-from meshagent.agents.event_publisher import (
-    _AgentMessageEmitter,
-    _AnthropicAgentEventPublisher,
-)
+from meshagent.agents.event_publisher import _AgentMessageEmitter
+from meshagent.anthropic.event_publisher import _AnthropicAgentEventPublisher
 import meshagent.anthropic.messages_adapter as messages_adapter_module
 from meshagent.anthropic.messages_adapter import (
     AnthropicMessagesAdapter,
@@ -60,6 +64,183 @@ class _NamelessParticipant:
     def get_attribute(self, name: str):
         del name
         return None
+
+
+def test_make_agent_event_reader_accumulates_streamed_text_for_restore() -> None:
+    adapter = AnthropicMessagesAdapter(model="claude-sonnet-4-6", client=object())
+    context = adapter.create_session()
+    restored_messages: list[dict[str, Any]] = []
+    reader = adapter.make_agent_event_reader(emit_message=restored_messages.append)
+
+    reader.consume(
+        AgentTextContentDelta(
+            type=AGENT_EVENT_TEXT_CONTENT_DELTA,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="text-1",
+            text="Hi",
+        )
+    )
+    reader.consume(
+        AgentTextContentDelta(
+            type=AGENT_EVENT_TEXT_CONTENT_DELTA,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="text-1",
+            text=" there",
+        )
+    )
+    reader.consume(
+        AgentTextContentDelta(
+            type=AGENT_EVENT_TEXT_CONTENT_DELTA,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="text-1",
+            text="Hi there",
+        )
+    )
+    reader.consume(
+        AgentTextContentEnded(
+            type=AGENT_EVENT_TEXT_CONTENT_ENDED,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="text-1",
+        )
+    )
+    adapter.restore_context_messages(context=context, messages=restored_messages)
+
+    assert context.messages == [
+        {"role": "assistant", "content": [{"type": "text", "text": "Hi there"}]}
+    ]
+
+
+@pytest.mark.parametrize(
+    ("namespace", "toolkit", "tool", "arguments", "expected_block"),
+    [
+        (
+            "meshagent",
+            "toolkit",
+            "custom_tool",
+            {"value": 1},
+            {
+                "type": "tool_use",
+                "id": "call-1",
+                "name": "toolkit_custom_tool",
+                "input": {"value": 1},
+            },
+        ),
+        (
+            "anthropic.messages",
+            "anthropic",
+            "web_search",
+            {"query": "meshagent"},
+            {"type": "web_search_tool_use", "id": "call-1", "query": "meshagent"},
+        ),
+        (
+            "anthropic.messages",
+            "server",
+            "search",
+            {"query": "meshagent"},
+            {
+                "type": "mcp_tool_use",
+                "id": "call-1",
+                "server_name": "server",
+                "name": "search",
+                "input": {"query": "meshagent"},
+            },
+        ),
+        (
+            "openai.responses",
+            "openai",
+            "apply_patch",
+            {"operation": {"type": "update_file", "path": "report.py", "diff": "@@"}},
+            {
+                "type": "tool_use",
+                "id": "call-1",
+                "name": "apply_patch_call",
+                "input": {
+                    "operation": {
+                        "type": "update_file",
+                        "path": "report.py",
+                        "diff": "@@",
+                    }
+                },
+            },
+        ),
+    ],
+)
+def test_make_agent_event_reader_restores_tool_lifecycle_as_anthropic_blocks(
+    namespace: str,
+    toolkit: str,
+    tool: str,
+    arguments: dict[str, object],
+    expected_block: dict[str, object],
+) -> None:
+    adapter = AnthropicMessagesAdapter(model="claude-sonnet-4-6", client=object())
+    context = adapter.create_session()
+    restored_messages: list[dict[str, Any]] = []
+    reader = adapter.make_agent_event_reader(emit_message=restored_messages.append)
+    serialized_arguments = json.dumps(arguments, separators=(",", ":"))
+    split_at = max(1, len(serialized_arguments) // 2)
+
+    for delta in (
+        serialized_arguments[:split_at],
+        serialized_arguments[split_at:],
+    ):
+        reader.consume(
+            AgentToolCallArgumentsDelta(
+                type=AGENT_EVENT_TOOL_CALL_ARGUMENTS_DELTA,
+                thread_id="thread-1",
+                turn_id="turn-1",
+                item_id="tool-1",
+                namespace=namespace,
+                call_id="call-1",
+                delta=delta,
+            )
+        )
+    reader.consume(
+        AgentToolCallStarted(
+            type=AGENT_EVENT_TOOL_CALL_STARTED,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="tool-1",
+            namespace=namespace,
+            call_id="call-1",
+            toolkit=toolkit,
+            tool=tool,
+            arguments=arguments,
+        )
+    )
+    reader.consume(
+        AgentToolCallEnded(
+            type=AGENT_EVENT_TOOL_CALL_ENDED,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="tool-1",
+            namespace=namespace,
+            call_id="call-1",
+            toolkit=toolkit,
+            tool=tool,
+            result=TextContent(text="tool result"),
+        )
+    )
+    reader.finalize()
+    adapter.restore_context_messages(context=context, messages=restored_messages)
+
+    assert context.messages[0] == {
+        "role": "assistant",
+        "content": [expected_block],
+    }
+    assert context.messages[1] == {
+        "role": "user",
+        "content": [
+            {
+                "type": "tool_result",
+                "tool_use_id": "call-1",
+                "content": [{"type": "text", "text": "tool result"}],
+            }
+        ],
+    }
 
 
 def test_store_usage_publishes_otel_usage_metrics(monkeypatch: pytest.MonkeyPatch):
@@ -806,7 +987,7 @@ async def test_next_batches_multiple_tool_results_into_single_user_message():
         tools=[_AnyArgsTool("tool_a"), _AnyArgsTool("tool_b")],
     )
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=ctx,
         caller=_DummyRoom().local_participant,
         toolkits=[toolkit],
@@ -855,7 +1036,7 @@ async def test_next_passes_thread_and_turn_ids_in_tool_caller_context():
     ctx.metadata["thread_id"] = "thread-1"
     ctx.metadata["turn_id"] = "turn-1"
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=ctx,
         caller=_DummyRoom().local_participant,
         toolkits=[Toolkit(name="test", tools=[tool])],
@@ -918,7 +1099,7 @@ async def test_next_uses_final_stream_item_as_tool_result() -> None:
     ctx.append_user_message("run tool")
 
     toolkit = Toolkit(name="test", tools=[_StreamingTool("tool_a")])
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=ctx,
         caller=_DummyRoom().local_participant,
         toolkits=[toolkit],
@@ -1245,7 +1426,7 @@ async def test_next_uses_model_specific_max_tokens_default() -> None:
     context = AgentSessionContext(system_role=None)
     context.append_user_message("hello")
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_DummyRoom().local_participant,
         toolkits=[],
@@ -1265,7 +1446,7 @@ async def test_next_uses_higher_opus_4_6_model_specific_max_tokens_default() -> 
     context = AgentSessionContext(system_role=None)
     context.append_user_message("hello")
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_DummyRoom().local_participant,
         toolkits=[],
@@ -1285,7 +1466,7 @@ async def test_next_uses_higher_opus_4_7_model_specific_max_tokens_default() -> 
     context = AgentSessionContext(system_role=None)
     context.append_user_message("hello")
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_DummyRoom().local_participant,
         toolkits=[],
@@ -1306,7 +1487,7 @@ async def test_next_prefers_explicit_max_tokens_over_model_default() -> None:
     context = AgentSessionContext(system_role=None)
     context.append_user_message("hello")
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_DummyRoom().local_participant,
         toolkits=[],
@@ -1326,7 +1507,7 @@ async def test_next_prefers_env_max_tokens_over_model_default(monkeypatch) -> No
     context = AgentSessionContext(system_role=None)
     context.append_user_message("hello")
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_DummyRoom().local_participant,
         toolkits=[],
@@ -1346,7 +1527,7 @@ async def test_next_uses_native_output_config_with_strict_schema() -> None:
     ctx = AgentSessionContext(system_role=None)
     ctx.append_user_message("answer")
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=ctx,
         caller=_DummyRoom().local_participant,
         toolkits=[],
@@ -1381,7 +1562,7 @@ async def test_next_transforms_unsupported_numeric_output_constraints() -> None:
     ctx = AgentSessionContext(system_role=None)
     ctx.append_user_message("answer")
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=ctx,
         caller=_DummyRoom().local_participant,
         toolkits=[],
@@ -1429,7 +1610,7 @@ async def test_next_normalizes_nullable_union_types_in_output_schema() -> None:
     ctx = AgentSessionContext(system_role=None)
     ctx.append_user_message("answer")
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=ctx,
         caller=_DummyRoom().local_participant,
         toolkits=[],
@@ -1500,7 +1681,7 @@ async def test_next_adaptive_mode_retries_with_loose_tools_after_grammar_error(
         _fake_stream_message,
     )
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=ctx,
         caller=_DummyRoom().local_participant,
         toolkits=[Toolkit(name="test", tools=[tool])],
@@ -1551,7 +1732,7 @@ async def test_next_adaptive_mode_enables_strict_after_local_tool_validation_fai
         _fake_stream_message,
     )
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=ctx,
         caller=_DummyRoom().local_participant,
         toolkits=[Toolkit(name="storage", tools=[tool])],
@@ -1598,7 +1779,7 @@ async def test_next_inserts_steering_messages_after_tool_results() -> None:
         context.append_user_message("steer now")
         return True
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_DummyRoom().local_participant,
         toolkits=[Toolkit(name="test", tools=[_AnyArgsTool("tool_a")])],
@@ -1664,7 +1845,7 @@ async def test_steering_followup_request_matches_plain_transcript_shape() -> Non
         context.append_user_message("steer now")
         return True
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_DummyRoom().local_participant,
         toolkits=[Toolkit(name="test", tools=[_AnyArgsTool("tool_a")])],
@@ -1774,7 +1955,7 @@ async def test_next_inserts_steering_before_trailing_tool_messages(
         context.append_user_message("steer now")
         return True
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_DummyRoom().local_participant,
         toolkits=[Toolkit(name="test", tools=[_AnyArgsTool("tool_a")])],
@@ -1859,7 +2040,7 @@ async def test_next_inserts_steering_after_first_completed_tool_when_multiple_to
         return True
 
     task = asyncio.create_task(
-        adapter.next(
+        adapter.create_response(
             context=context,
             caller=_DummyRoom().local_participant,
             toolkits=[Toolkit(name="test", tools=[tool_a, tool_b])],
@@ -1947,7 +2128,7 @@ async def test_next_restores_context_when_cancelled_during_tool_call() -> None:
     context.append_user_message("run tool")
 
     task = asyncio.create_task(
-        adapter.next(
+        adapter.create_response(
             context=context,
             caller=_DummyRoom().local_participant,
             toolkits=[Toolkit(name="test", tools=[blocking_tool])],
@@ -1988,7 +2169,7 @@ async def test_next_raises_on_truncated_tool_calls_before_appending_assistant_me
         RoomException,
         match="Anthropic response hit max_tokens before completing tool calls",
     ):
-        await adapter.next(
+        await adapter.create_response(
             context=context,
             caller=_DummyRoom().local_participant,
             toolkits=[Toolkit(name="storage", tools=[_WriteFileLikeTool()])],
@@ -2041,7 +2222,7 @@ async def test_next_marks_truncated_streamed_tool_calls_as_failed(
         RoomException,
         match="Anthropic response hit max_tokens before completing tool calls",
     ):
-        await adapter.next(
+        await adapter.create_response(
             context=context,
             caller=_DummyRoom().local_participant,
             toolkits=[Toolkit(name="storage", tools=[_WriteFileLikeTool()])],
@@ -2084,7 +2265,7 @@ async def test_next_continues_on_pause_turn() -> None:
     context = AgentSessionContext(system_role=None)
     context.append_user_message("search")
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_DummyRoom().local_participant,
         toolkits=[],
@@ -2128,7 +2309,7 @@ async def test_next_raises_on_truncated_text_response_after_appending_assistant_
         RoomException,
         match="Anthropic response hit max_tokens before completing the turn",
     ):
-        await adapter.next(
+        await adapter.create_response(
             context=context,
             caller=_DummyRoom().local_participant,
             toolkits=[],
@@ -2158,7 +2339,7 @@ async def test_next_raises_on_model_context_window_exceeded_after_appending_assi
         RoomException,
         match="Anthropic response hit the model context window before completing the turn",
     ):
-        await adapter.next(
+        await adapter.create_response(
             context=context,
             caller=_DummyRoom().local_participant,
             toolkits=[],
@@ -2252,7 +2433,7 @@ async def test_next_adds_auto_compaction_request_fields() -> None:
     context = AgentSessionContext(system_role=None)
     context.append_user_message("hello")
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_DummyRoom().local_participant,
         toolkits=[],
@@ -2284,7 +2465,7 @@ async def test_next_preserves_existing_betas_when_adding_compaction_beta() -> No
     context = AgentSessionContext(system_role=None)
     context.append_user_message("hello")
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_DummyRoom().local_participant,
         toolkits=[],
@@ -2307,7 +2488,7 @@ async def test_next_skips_auto_compaction_for_legacy_model_versions() -> None:
     context = AgentSessionContext(system_role=None)
     context.append_user_message("hello")
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_DummyRoom().local_participant,
         toolkits=[],
@@ -2335,7 +2516,7 @@ async def test_next_locally_compacts_anthropic_request_before_send() -> None:
     context.append_user_message("latest user")
     context.metadata["last_response_usage"] = {"input_tokens": 200_000}
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_DummyRoom().local_participant,
         toolkits=[],
@@ -2388,7 +2569,7 @@ async def test_next_retries_after_prompt_too_long_with_local_compaction(
     context.append_assistant_message("old assistant")
     context.append_user_message("latest user")
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_DummyRoom().local_participant,
         toolkits=[],
@@ -2423,7 +2604,7 @@ async def test_next_uses_context_management_beta_for_non_compaction_edits() -> N
     context = AgentSessionContext(system_role=None)
     context.append_user_message("hello")
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_DummyRoom().local_participant,
         toolkits=[],
@@ -2447,7 +2628,7 @@ async def test_next_merges_header_betas_into_request_betas_for_web_fetch_compact
     context = AgentSessionContext(system_role=None)
     context.append_user_message("hello")
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_DummyRoom().local_participant,
         toolkits=[Toolkit(name="web_fetch", tools=[WebFetchTool()])],
@@ -2472,7 +2653,7 @@ async def test_next_omits_on_behalf_of_header_when_name_is_missing() -> None:
     context = AgentSessionContext(system_role=None)
     context.append_user_message("hello")
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_DummyRoom().local_participant,
         on_behalf_of=_NamelessParticipant(),
@@ -2509,7 +2690,7 @@ async def test_next_stores_usage_metadata() -> None:
     context = AgentSessionContext(system_role=None)
     context.append_user_message("hello")
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_DummyRoom().local_participant,
         toolkits=[],
@@ -2554,7 +2735,7 @@ async def test_next_stores_usage_for_streaming_response(monkeypatch) -> None:
 
     monkeypatch.setattr(adapter, "_stream_message", _fake_stream_message)
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_DummyRoom().local_participant,
         toolkits=[],
@@ -2596,7 +2777,7 @@ async def test_next_streams_without_event_handler(monkeypatch) -> None:
 
     monkeypatch.setattr(adapter, "_stream_message", _fake_stream_message)
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_DummyRoom().local_participant,
         toolkits=[],
@@ -2617,7 +2798,7 @@ async def test_next_accepts_options_keyword_argument() -> None:
     context = AgentSessionContext(system_role=None)
     context.append_user_message("hello")
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_DummyRoom().local_participant,
         toolkits=[],
@@ -2667,7 +2848,7 @@ async def test_next_retries_after_retryable_anthropic_status_error(
     monkeypatch.setattr(adapter, "_stream_message", _fake_stream_message)
 
     with caplog.at_level(logging.WARNING, logger="anthropic_agent"):
-        result = await adapter.next(
+        result = await adapter.create_response(
             context=context,
             caller=_DummyRoom().local_participant,
             toolkits=[],
@@ -2740,7 +2921,7 @@ async def test_next_retries_after_anthropic_connection_error(
     )
     monkeypatch.setattr(adapter, "_stream_message", _fake_stream_message)
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=context,
         caller=_DummyRoom().local_participant,
         toolkits=[],

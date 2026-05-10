@@ -137,7 +137,7 @@ async def test_live_anthropic_adapter_messages_create_if_key_set():
     ctx = AgentSessionContext(system_role=None)
     ctx.append_user_message("Say hello in one word.")
 
-    text = await adapter.next(
+    text = await adapter.create_response(
         context=ctx,
         caller=_DummyRoom().local_participant,
         toolkits=[],
@@ -167,7 +167,7 @@ async def test_live_anthropic_adapter_streaming_if_key_set():
         if isinstance(event, dict) and "type" in event:
             seen_types.append(event["type"])
 
-    text = await adapter.next(
+    text = await adapter.create_response(
         context=ctx,
         caller=_DummyRoom().local_participant,
         toolkits=[],
@@ -223,7 +223,7 @@ async def test_live_anthropic_mcp_deepwiki_if_key_set():
             if content_block.get("type") in {"mcp_tool_use", "mcp_tool_result"}:
                 seen_mcp_blocks = True
 
-    text = await adapter.next(
+    text = await adapter.create_response(
         context=ctx,
         caller=_DummyRoom().local_participant,
         toolkits=[mcp_toolkit],
@@ -264,7 +264,7 @@ async def test_live_anthropic_adapter_compaction_if_key_set():
     )
 
     try:
-        first = await adapter.next(
+        first = await adapter.create_response(
             context=ctx,
             caller=_DummyRoom().local_participant,
             toolkits=[],
@@ -277,7 +277,7 @@ async def test_live_anthropic_adapter_compaction_if_key_set():
     assert isinstance(first, str)
 
     ctx.append_user_message("Now reply with the single word 'done'.")
-    second = await adapter.next(
+    second = await adapter.create_response(
         context=ctx,
         caller=_DummyRoom().local_participant,
         toolkits=[],
@@ -321,7 +321,7 @@ async def test_live_anthropic_inserts_steer_immediately_after_tool_results_if_ke
         return True
 
     task = asyncio.create_task(
-        adapter.next(
+        adapter.create_response(
             context=ctx,
             caller=_DummyRoom().local_participant,
             toolkits=[Toolkit(name="test", tools=[tool])],
@@ -389,7 +389,7 @@ async def test_live_anthropic_inserts_steer_after_first_completed_tool_when_two_
         return True
 
     task = asyncio.create_task(
-        adapter.next(
+        adapter.create_response(
             context=ctx,
             caller=_DummyRoom().local_participant,
             toolkits=[Toolkit(name="test", tools=[alpha_tool, beta_tool])],
@@ -500,7 +500,7 @@ async def test_live_anthropic_keeps_plain_user_turn_after_tool_result_if_key_set
         ]
     )
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=ctx,
         caller=_DummyRoom().local_participant,
         toolkits=[Toolkit(name="test", tools=[_SteeringProbeTool()])],

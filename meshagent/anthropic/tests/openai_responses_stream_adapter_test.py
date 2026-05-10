@@ -219,10 +219,10 @@ async def test_openai_responses_stream_uses_beta_messages_api_when_betas_present
 
 
 @pytest.mark.asyncio
-async def test_openai_responses_stream_next_forwards_options(monkeypatch):
+async def test_openai_responses_stream_create_response_forwards_options(monkeypatch):
     called: dict = {}
 
-    async def _fake_next(
+    async def _fake_create_response(
         self,
         *,
         context,
@@ -233,6 +233,7 @@ async def test_openai_responses_stream_next_forwards_options(monkeypatch):
         steering_callback=None,
         model=None,
         on_behalf_of=None,
+        tool_choice=None,
         options=None,
     ):
         del self
@@ -244,14 +245,17 @@ async def test_openai_responses_stream_next_forwards_options(monkeypatch):
         del steering_callback
         del model
         del on_behalf_of
+        del tool_choice
         called["options"] = options
         return "ok"
 
-    monkeypatch.setattr(AnthropicMessagesAdapter, "next", _fake_next)
+    monkeypatch.setattr(
+        AnthropicMessagesAdapter, "create_response", _fake_create_response
+    )
 
     adapter = AnthropicOpenAIResponsesStreamAdapter(client=object())
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=AgentSessionContext(system_role=None),
         caller=object(),
         toolkits=[],
@@ -263,10 +267,12 @@ async def test_openai_responses_stream_next_forwards_options(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_openai_responses_stream_next_forwards_steering_callback(monkeypatch):
+async def test_openai_responses_stream_create_response_forwards_steering_callback(
+    monkeypatch,
+):
     called: dict = {"steering_callback": None}
 
-    async def _fake_next(
+    async def _fake_create_response(
         self,
         *,
         context,
@@ -277,6 +283,7 @@ async def test_openai_responses_stream_next_forwards_steering_callback(monkeypat
         steering_callback=None,
         model=None,
         on_behalf_of=None,
+        tool_choice=None,
         options=None,
     ):
         del self
@@ -287,13 +294,16 @@ async def test_openai_responses_stream_next_forwards_steering_callback(monkeypat
         del event_handler
         del model
         del on_behalf_of
+        del tool_choice
         del options
         called["steering_callback"] = steering_callback
         if steering_callback is None:
             return False
         return await steering_callback()
 
-    monkeypatch.setattr(AnthropicMessagesAdapter, "next", _fake_next)
+    monkeypatch.setattr(
+        AnthropicMessagesAdapter, "create_response", _fake_create_response
+    )
 
     adapter = AnthropicOpenAIResponsesStreamAdapter(client=object())
     steering_calls = 0
@@ -303,7 +313,7 @@ async def test_openai_responses_stream_next_forwards_steering_callback(monkeypat
         steering_calls += 1
         return True
 
-    result = await adapter.next(
+    result = await adapter.create_response(
         context=AgentSessionContext(system_role=None),
         caller=object(),
         toolkits=[],

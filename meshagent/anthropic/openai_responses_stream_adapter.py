@@ -388,7 +388,7 @@ class AnthropicOpenAIResponsesStreamAdapter(AnthropicMessagesAdapter):
         emit({"type": "response.completed", "response": dict(response_obj)})
         return final_message
 
-    async def next(
+    async def create_response(
         self,
         *,
         context: AgentSessionContext,
@@ -402,7 +402,7 @@ class AnthropicOpenAIResponsesStreamAdapter(AnthropicMessagesAdapter):
         tool_choice: ToolChoice | None = None,
         options: Optional[dict] = None,
     ) -> Any:
-        return await super().next(
+        return await super().create_response(
             context=context,
             caller=caller,
             toolkits=toolkits,
