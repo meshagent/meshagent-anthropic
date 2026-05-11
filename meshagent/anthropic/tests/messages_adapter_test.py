@@ -42,6 +42,7 @@ from meshagent.anthropic.messages_adapter import (
 )
 from meshagent.anthropic.web_fetch import WebFetchTool
 from meshagent.agents.agent import AgentSessionContext
+from meshagent.agents.context import SessionUsage
 from meshagent.api.messaging import FileContent, JsonContent, TextContent
 from meshagent.tools import FunctionTool, Toolkit, ToolContext
 from meshagent.api import RoomException
@@ -288,11 +289,15 @@ def test_store_usage_publishes_otel_usage_metrics(monkeypatch: pytest.MonkeyPatc
             "annotations": {"env": "prod"},
         }
     ]
-    assert context.metadata["last_response_flattened_usage"] == {
-        "input_tokens": 10.0,
-        "output_tokens": 5.0,
-    }
-    assert context.metadata["last_response_context_used_tokens"] == 15
+    assert context.last_usage == SessionUsage(
+        model="claude-sonnet-4-6",
+        usage={
+            "input_tokens": 10.0,
+            "output_tokens": 5.0,
+        },
+        context_window_used=15,
+        context_window_size=1_000_000,
+    )
 
 
 def test_store_usage_tracks_prompt_cache_usage() -> None:
@@ -320,19 +325,17 @@ def test_store_usage_tracks_prompt_cache_usage() -> None:
         model="claude-sonnet-4-6",
     )
 
-    assert context.metadata["last_response_flattened_usage"] == {
-        "input_tokens": 100.0,
-        "cache_creation_input_tokens": 1000.0,
-        "cache_read_input_tokens": 900.0,
-        "output_tokens": 5.0,
-    }
-    assert context.metadata["last_response_context_used_tokens"] == 2005
-    assert context.usage == {
-        "input_tokens": 100.0,
-        "cache_creation_input_tokens": 1000.0,
-        "cache_read_input_tokens": 900.0,
-        "output_tokens": 5.0,
-    }
+    assert context.last_usage == SessionUsage(
+        model="claude-sonnet-4-6",
+        usage={
+            "input_tokens": 100.0,
+            "cache_creation_input_tokens": 1000.0,
+            "cache_read_input_tokens": 900.0,
+            "output_tokens": 5.0,
+        },
+        context_window_used=2005,
+        context_window_size=1_000_000,
+    )
 
 
 class _DummyRoom:
@@ -2514,7 +2517,10 @@ async def test_next_locally_compacts_anthropic_request_before_send() -> None:
     context.append_user_message("old user")
     context.append_assistant_message("old assistant")
     context.append_user_message("latest user")
-    context.metadata["last_response_usage"] = {"input_tokens": 200_000}
+    context.last_usage = SessionUsage(
+        model="claude-sonnet-4-6",
+        usage={"input_tokens": 200_000},
+    )
 
     result = await adapter.create_response(
         context=context,
@@ -2698,18 +2704,15 @@ async def test_next_stores_usage_metadata() -> None:
 
     assert result == "ok"
     assert context.turn_count == 1
-    assert context.metadata["last_response_model"] == adapter.default_model()
-    assert context.metadata["last_response_usage"]["input_tokens"] == 10
-    assert context.metadata["last_response_usage"]["output_tokens"] == 5
-    assert context.metadata["last_response_flattened_usage"] == {
-        "input_tokens": 10.0,
-        "output_tokens": 5.0,
-    }
-    assert context.metadata["last_response_context_used_tokens"] == 15
-    assert context.usage == {
-        "input_tokens": 10.0,
-        "output_tokens": 5.0,
-    }
+    assert context.last_usage == SessionUsage(
+        model=adapter.default_model(),
+        usage={
+            "input_tokens": 10.0,
+            "output_tokens": 5.0,
+        },
+        context_window_used=15,
+        context_window_size=200_000,
+    )
 
 
 @pytest.mark.asyncio
@@ -2745,20 +2748,17 @@ async def test_next_stores_usage_for_streaming_response(monkeypatch) -> None:
     assert result == "ok"
     assert events[0]["type"] == "message.delta"
     assert context.turn_count == 1
-    assert context.metadata["last_response_usage"]["input_tokens"] == 7
-    assert context.metadata["last_response_flattened_usage"] == {
-        "input_tokens": 7.0,
-        "cache_creation_input_tokens": 1000.0,
-        "cache_read_input_tokens": 900.0,
-        "output_tokens": 4.0,
-    }
-    assert context.metadata["last_response_context_used_tokens"] == 1911
-    assert context.usage == {
-        "input_tokens": 7.0,
-        "cache_creation_input_tokens": 1000.0,
-        "cache_read_input_tokens": 900.0,
-        "output_tokens": 4.0,
-    }
+    assert context.last_usage == SessionUsage(
+        model=adapter.default_model(),
+        usage={
+            "input_tokens": 7.0,
+            "cache_creation_input_tokens": 1000.0,
+            "cache_read_input_tokens": 900.0,
+            "output_tokens": 4.0,
+        },
+        context_window_used=1911,
+        context_window_size=200_000,
+    )
 
 
 @pytest.mark.asyncio

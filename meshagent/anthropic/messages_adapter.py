@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from meshagent.agents.agent import AgentSessionContext
+from meshagent.agents.context import SessionUsage, SessionUsageCallback
 from meshagent.api import Participant, RoomException
 from meshagent.api.http import (
     llm_annotation_headers,
@@ -62,7 +63,6 @@ from meshagent.anthropic.proxy import (
 )
 from meshagent.anthropic.request_tool import AnthropicRequestTool
 from meshagent.anthropic.usage import (
-    add_usage_metrics,
     normalize_anthropic_usage,
     preprocess_anthropic_usage,
     track_otel_usage_metrics,
@@ -1238,8 +1238,13 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
             return "Anthropic refused to respond."
         return None
 
-    def create_session(self) -> AgentSessionContext:
-        return AnthropicMessagesChatContext(system_role=None)
+    def create_session(
+        self, *, usage_callback: SessionUsageCallback | None = None
+    ) -> AgentSessionContext:
+        return AnthropicMessagesChatContext(
+            system_role=None,
+            usage_callback=usage_callback,
+        )
 
     def make_agent_event_reader(
         self,
@@ -1804,9 +1809,9 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
         if usable_limit is None:
             return False
 
-        recent_input_tokens = _total_input_tokens_from_usage(
-            context.metadata.get("last_response_usage")
-        )
+        recent_input_tokens = 0
+        if context.last_usage is not None:
+            recent_input_tokens = int(context.last_usage.usage.get("input_tokens", 0.0))
         if recent_input_tokens <= 0:
             return False
 
@@ -2029,18 +2034,18 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
     ) -> None:
         usage = normalize_anthropic_usage(response.get("usage"))
         if usage is not None:
-            context.metadata["last_response_usage"] = usage
-            context.metadata["last_response_model"] = model
-
             flattened_usage = preprocess_anthropic_usage(model=model, usage=usage)
             if flattened_usage is not None:
-                context.metadata["last_response_flattened_usage"] = dict(
-                    flattened_usage
+                context.emit_usage_updated(
+                    SessionUsage(
+                        model=model,
+                        usage=dict(flattened_usage),
+                        context_window_used=self._context_used_tokens_from_usage(
+                            flattened_usage
+                        ),
+                        context_window_size=int(self.context_window_size(model)),
+                    )
                 )
-                context.metadata["last_response_context_used_tokens"] = (
-                    self._context_used_tokens_from_usage(flattened_usage)
-                )
-                add_usage_metrics(totals=context.usage, usage=flattened_usage)
                 track_otel_usage_metrics(
                     model=model,
                     provider="anthropic",

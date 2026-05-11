@@ -284,10 +284,9 @@ async def test_live_anthropic_adapter_compaction_if_key_set():
     )
     assert isinstance(second, str)
     assert len(second.strip()) > 0
-    assert ctx.metadata.get("last_response_model") == model
-    usage = ctx.metadata.get("last_response_usage")
-    assert isinstance(usage, dict)
-    assert int(usage.get("input_tokens", 0)) > 0
+    assert ctx.last_usage is not None
+    assert ctx.last_usage.model == model
+    assert int(ctx.last_usage.usage.get("input_tokens", 0)) > 0
 
 
 @pytest.mark.asyncio
