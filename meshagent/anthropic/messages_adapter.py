@@ -1117,7 +1117,9 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
         self._tool_calling_state = _AnthropicToolCallingState(mode=tool_calling_mode)
         self._friendly_name = friendly_name
         self._description = description
-        self._allowed_models = list(allowed_models) if allowed_models is not None else None
+        self._allowed_models = (
+            list(allowed_models) if allowed_models is not None else None
+        )
 
     def default_model(self) -> str:
         return self._model
