@@ -48,6 +48,14 @@ from meshagent.tools import FunctionTool, Toolkit, ToolContext
 from meshagent.api import RoomException
 
 
+def test_list_models_advertises_attachment_capabilities() -> None:
+    model = AnthropicMessagesAdapter(model="claude-3-5-sonnet-latest").list_models()[0]
+
+    assert model.supports_attachments is True
+    assert "image/png" in model.accepts
+    assert "application/pdf" in model.accepts
+
+
 class _DummyParticipant:
     def __init__(self):
         self.id = "p1"
@@ -2393,6 +2401,50 @@ def test_create_chat_context_supports_remote_image_and_file_urls() -> None:
             "type": "url",
             "url": "https://example.com/report.pdf",
         },
+    }
+
+
+def test_create_chat_context_supports_data_url_text_file() -> None:
+    adapter = AnthropicMessagesAdapter(client=object())
+    context = adapter.create_session()
+
+    message = context.append_file_url(
+        url="data:text/plain;name=note.txt;base64,aGVsbG8="
+    )
+
+    assert message["content"][0] == {
+        "type": "text",
+        "text": "attached file note.txt (text/plain):\nhello",
+    }
+
+
+def test_create_chat_context_supports_data_url_image_file() -> None:
+    adapter = AnthropicMessagesAdapter(client=object())
+    context = adapter.create_session()
+
+    message = context.append_file_url(url="data:image/png;name=image.png;base64,cG5n")
+
+    assert message["content"][0] == {
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": "image/png",
+            "data": "cG5n",
+        },
+    }
+
+
+def test_create_chat_context_replaces_unsupported_data_url_file_with_note() -> None:
+    adapter = AnthropicMessagesAdapter(client=object())
+    context = adapter.create_session()
+
+    message = context.append_file_url(
+        url="data:application/octet-stream;name=blob.bin;base64,YmxvYg=="
+    )
+
+    assert message["content"][0] == {
+        "type": "text",
+        "text": "the user attached blob.bin with unsupported mime type application/octet-stream",
     }
 
 

@@ -44,6 +44,7 @@ from meshagent.agents.agent_event_reader import (
 import json
 from typing import Any, Optional, Callable, Literal
 from collections.abc import AsyncIterable, Mapping
+from dataclasses import dataclass
 import os
 import logging
 import re
@@ -52,7 +53,7 @@ import base64
 import mimetypes
 import copy
 from html_to_markdown import convert
-from urllib.parse import urlparse
+from urllib.parse import unquote, unquote_to_bytes, urlparse
 
 from meshagent.anthropic.proxy import (
     get_client,
@@ -100,11 +101,71 @@ _ANTHROPIC_STEERING_MARKER = "TURN INTERRUPTED"
 _ANTHROPIC_DEFAULT_MAX_RETRIES = 10
 _ANTHROPIC_DEFAULT_RETRY_BACKOFF_SECONDS = 1.0
 _ANTHROPIC_MAX_RETRY_BACKOFF_SECONDS = 30.0
+_ANTHROPIC_MAX_INLINE_IMAGE_BYTES = 5 * 1024 * 1024
+_ANTHROPIC_MAX_INLINE_PDF_BYTES = 32 * 1024 * 1024
+_ANTHROPIC_MAX_INLINE_TEXT_BYTES = 1 * 1024 * 1024
+_ANTHROPIC_ACCEPTED_ATTACHMENT_TYPES = (
+    "image/jpeg",
+    "image/png",
+    "image/gif",
+    "image/webp",
+    "application/pdf",
+    "text/*",
+    "application/json",
+    "application/xhtml+xml",
+)
 _ANTHROPIC_STEERING_INSTRUCTIONS = (
     "If the transcript contains an assistant message exactly equal to "
     f"'{_ANTHROPIC_STEERING_MARKER}', then treat the immediately following user "
     "message as steering that takes precedence over any unfinished prior plan."
 )
+
+
+@dataclass(frozen=True)
+class _DataUrlAttachment:
+    filename: str
+    mime_type: str
+    data: bytes
+
+
+def _decode_data_url_attachment(url: str) -> _DataUrlAttachment | None:
+    if not url.startswith("data:"):
+        return None
+    header, separator, payload = url[5:].partition(",")
+    if separator == "":
+        return None
+
+    parts = [part.strip() for part in header.split(";") if part.strip()]
+    mime_type = "text/plain"
+    parameter_parts = parts
+    if parts and "/" in parts[0]:
+        mime_type = parts[0].lower()
+        parameter_parts = parts[1:]
+
+    is_base64 = False
+    filename = "attachment"
+    for part in parameter_parts:
+        lower = part.lower()
+        if lower == "base64":
+            is_base64 = True
+            continue
+        key, key_separator, value = part.partition("=")
+        if key_separator != "=":
+            continue
+        if key.strip().lower() in {"name", "filename"}:
+            decoded = unquote(value.strip().strip('"'))
+            if decoded:
+                filename = decoded
+
+    try:
+        data = (
+            base64.b64decode(payload, validate=False)
+            if is_base64
+            else unquote_to_bytes(payload)
+        )
+    except Exception:
+        return None
+    return _DataUrlAttachment(filename=filename, mime_type=mime_type, data=data)
 
 
 class _AnthropicToolCallingState:
@@ -488,16 +549,13 @@ class AnthropicMessagesChatContext(AgentSessionContext):
 
         allowed_mime_types = {"image/jpeg", "image/png", "image/gif", "image/webp"}
         if normalized_mime_type not in allowed_mime_types:
-            message = {
-                "role": "user",
-                "content": [
-                    _text_block(
-                        f"the user attached an image in unsupported format {normalized_mime_type}"
-                    )
-                ],
-            }
-            self.messages.append(message)
-            return message
+            return self._append_attachment_note(
+                f"the user attached an image in unsupported format {normalized_mime_type}"
+            )
+        if len(data) > _ANTHROPIC_MAX_INLINE_IMAGE_BYTES:
+            return self._append_attachment_note(
+                f"the user attached an image ({normalized_mime_type}) that was too large to include"
+            )
 
         message = {
             "role": "user",
@@ -516,6 +574,12 @@ class AnthropicMessagesChatContext(AgentSessionContext):
         return message
 
     def append_image_url(self, *, url: str) -> dict:
+        data_url = _decode_data_url_attachment(url)
+        if data_url is not None:
+            return self.append_image_message(
+                mime_type=data_url.mime_type,
+                data=data_url.data,
+            )
         message = {
             "role": "user",
             "content": [
@@ -543,6 +607,10 @@ class AnthropicMessagesChatContext(AgentSessionContext):
             )
 
         if normalized_mime_type == "application/pdf":
+            if len(data) > _ANTHROPIC_MAX_INLINE_PDF_BYTES:
+                return self._append_attachment_note(
+                    f"the user attached {filename} ({normalized_mime_type}) but it was too large to include"
+                )
             message = {
                 "role": "user",
                 "content": [
@@ -565,6 +633,10 @@ class AnthropicMessagesChatContext(AgentSessionContext):
             or normalized_mime_type == "application/json"
             or normalized_mime_type == "application/xhtml+xml"
         ):
+            if len(data) > _ANTHROPIC_MAX_INLINE_TEXT_BYTES:
+                return self._append_attachment_note(
+                    f"the user attached {filename} ({normalized_mime_type}) but it was too large to include"
+                )
             if _is_html_mime_type(normalized_mime_type):
                 text = convert(_decode_text(data))
             else:
@@ -581,18 +653,19 @@ class AnthropicMessagesChatContext(AgentSessionContext):
             self.messages.append(message)
             return message
 
-        message = {
-            "role": "user",
-            "content": [
-                _text_block(
-                    f"the user attached a file named {filename} with mime type {normalized_mime_type}"
-                )
-            ],
-        }
-        self.messages.append(message)
-        return message
+        return self._append_attachment_note(
+            f"the user attached {filename} with unsupported mime type {normalized_mime_type}"
+        )
 
     def append_file_url(self, *, url: str) -> dict:
+        data_url = _decode_data_url_attachment(url)
+        if data_url is not None:
+            return self.append_file_message(
+                filename=data_url.filename,
+                mime_type=data_url.mime_type,
+                data=data_url.data,
+            )
+
         parsed_url = urlparse(url)
         guessed_mime_type, _ = mimetypes.guess_type(parsed_url.path)
         normalized_mime_type = (guessed_mime_type or "application/octet-stream").lower()
@@ -622,6 +695,11 @@ class AnthropicMessagesChatContext(AgentSessionContext):
             "role": "user",
             "content": [_text_block(f"the user attached a file available at {url}")],
         }
+        self.messages.append(message)
+        return message
+
+    def _append_attachment_note(self, text: str) -> dict:
+        message = {"role": "user", "content": [_text_block(text)]}
         self.messages.append(message)
         return message
 
@@ -1142,6 +1220,8 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
                 name=name,
                 context_window=int(self.context_window_size(name)),
                 pricing=llm_model_pricing(provider="anthropic", model=name),
+                supports_attachments=True,
+                accepts=_ANTHROPIC_ACCEPTED_ATTACHMENT_TYPES,
             )
             for name in names
         ]
