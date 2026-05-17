@@ -2409,7 +2409,7 @@ def test_create_chat_context_supports_data_url_text_file() -> None:
     context = adapter.create_session()
 
     message = context.append_file_url(
-        url="data:text/plain;name=note.txt;base64,aGVsbG8="
+        url="data:text/plain;base64,aGVsbG8=", filename="note.txt"
     )
 
     assert message["content"][0] == {
@@ -2422,7 +2422,9 @@ def test_create_chat_context_supports_data_url_image_file() -> None:
     adapter = AnthropicMessagesAdapter(client=object())
     context = adapter.create_session()
 
-    message = context.append_file_url(url="data:image/png;name=image.png;base64,cG5n")
+    message = context.append_file_url(
+        url="data:image/png;base64,cG5n", filename="image.png"
+    )
 
     assert message["content"][0] == {
         "type": "image",
@@ -2439,7 +2441,7 @@ def test_create_chat_context_replaces_unsupported_data_url_file_with_note() -> N
     context = adapter.create_session()
 
     message = context.append_file_url(
-        url="data:application/octet-stream;name=blob.bin;base64,YmxvYg=="
+        url="data:application/octet-stream;base64,YmxvYg==", filename="blob.bin"
     )
 
     assert message["content"][0] == {

@@ -53,7 +53,7 @@ import base64
 import mimetypes
 import copy
 from html_to_markdown import convert
-from urllib.parse import unquote, unquote_to_bytes, urlparse
+from urllib.parse import unquote_to_bytes, urlparse
 
 from meshagent.anthropic.proxy import (
     get_client,
@@ -123,7 +123,6 @@ _ANTHROPIC_STEERING_INSTRUCTIONS = (
 
 @dataclass(frozen=True)
 class _DataUrlAttachment:
-    filename: str
     mime_type: str
     data: bytes
 
@@ -143,19 +142,10 @@ def _decode_data_url_attachment(url: str) -> _DataUrlAttachment | None:
         parameter_parts = parts[1:]
 
     is_base64 = False
-    filename = "attachment"
     for part in parameter_parts:
         lower = part.lower()
         if lower == "base64":
             is_base64 = True
-            continue
-        key, key_separator, value = part.partition("=")
-        if key_separator != "=":
-            continue
-        if key.strip().lower() in {"name", "filename"}:
-            decoded = unquote(value.strip().strip('"'))
-            if decoded:
-                filename = decoded
 
     try:
         data = (
@@ -165,7 +155,7 @@ def _decode_data_url_attachment(url: str) -> _DataUrlAttachment | None:
         )
     except Exception:
         return None
-    return _DataUrlAttachment(filename=filename, mime_type=mime_type, data=data)
+    return _DataUrlAttachment(mime_type=mime_type, data=data)
 
 
 class _AnthropicToolCallingState:
@@ -657,11 +647,11 @@ class AnthropicMessagesChatContext(AgentSessionContext):
             f"the user attached {filename} with unsupported mime type {normalized_mime_type}"
         )
 
-    def append_file_url(self, *, url: str) -> dict:
+    def append_file_url(self, *, url: str, filename: str | None = None) -> dict:
         data_url = _decode_data_url_attachment(url)
         if data_url is not None:
             return self.append_file_message(
-                filename=data_url.filename,
+                filename=filename or "attachment",
                 mime_type=data_url.mime_type,
                 data=data_url.data,
             )
@@ -719,7 +709,84 @@ class AnthropicMessagesAgentEventReader(AccumulatingAgentEventReader):
             elif item_type == "file":
                 url = item.get("url")
                 if isinstance(url, str):
-                    blocks.append(_text_block(f"the user attached a file: {url}"))
+                    name_value = item.get("name")
+                    filename = (
+                        name_value.strip()
+                        if isinstance(name_value, str) and name_value.strip() != ""
+                        else "attachment"
+                    )
+                    data_url = _decode_data_url_attachment(url)
+                    if data_url is None:
+                        blocks.append(_text_block(f"the user attached a file: {url}"))
+                        continue
+
+                    normalized_mime_type = (
+                        (data_url.mime_type or "application/octet-stream")
+                        .lower()
+                        .strip()
+                    )
+                    if normalized_mime_type.startswith("image/"):
+                        blocks.append(
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": normalized_mime_type,
+                                    "data": base64.b64encode(data_url.data).decode(
+                                        "utf-8"
+                                    ),
+                                },
+                            }
+                        )
+                    elif normalized_mime_type == "application/pdf":
+                        if len(data_url.data) > _ANTHROPIC_MAX_INLINE_PDF_BYTES:
+                            blocks.append(
+                                _text_block(
+                                    f"the user attached {filename} ({normalized_mime_type}) but it was too large to include"
+                                )
+                            )
+                        else:
+                            blocks.append(
+                                {
+                                    "type": "document",
+                                    "title": filename,
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": normalized_mime_type,
+                                        "data": base64.b64encode(data_url.data).decode(
+                                            "utf-8"
+                                        ),
+                                    },
+                                }
+                            )
+                    elif (
+                        normalized_mime_type.startswith("text/")
+                        or normalized_mime_type == "application/json"
+                        or normalized_mime_type == "application/xhtml+xml"
+                    ):
+                        if len(data_url.data) > _ANTHROPIC_MAX_INLINE_TEXT_BYTES:
+                            blocks.append(
+                                _text_block(
+                                    f"the user attached {filename} ({normalized_mime_type}) but it was too large to include"
+                                )
+                            )
+                        else:
+                            text = (
+                                convert(_decode_text(data_url.data))
+                                if _is_html_mime_type(normalized_mime_type)
+                                else _decode_text(data_url.data)
+                            )
+                            blocks.append(
+                                _text_block(
+                                    f"attached file {filename} ({normalized_mime_type}):\n{text}"
+                                )
+                            )
+                    else:
+                        blocks.append(
+                            _text_block(
+                                f"the user attached {filename} with unsupported mime type {normalized_mime_type}"
+                            )
+                        )
         if not blocks:
             blocks.append(_text_block(json.dumps(content)))
         self._emit_context_message({"role": "user", "content": blocks})
