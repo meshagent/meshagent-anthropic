@@ -22,6 +22,7 @@ from meshagent.api.messaging import (
     JsonContent,
     TextContent,
     EmptyContent,
+    ErrorContent,
     RawOutputsContent,
     ensure_content,
 )
@@ -844,6 +845,7 @@ class AnthropicMessagesAgentEventReader(AccumulatingAgentEventReader):
         self,
         *,
         event_type: str,
+        turn_id: str,
         item_id: str,
         call_id: str | None,
         toolkit: str,
@@ -851,11 +853,11 @@ class AnthropicMessagesAgentEventReader(AccumulatingAgentEventReader):
         arguments: dict[str, Any] | None,
         images: list[dict[str, Any]],
         status: str,
-        status_detail: str | None,
     ) -> None:
         item = {
             "type": "image_generation",
             "event_type": event_type,
+            "turn_id": turn_id,
             "item_id": item_id,
             "call_id": call_id,
             "toolkit": toolkit,
@@ -863,7 +865,6 @@ class AnthropicMessagesAgentEventReader(AccumulatingAgentEventReader):
             "arguments": arguments,
             "images": images,
             "status": status,
-            "status_detail": status_detail,
         }
         self._emit_context_message(
             {"role": "assistant", "content": [_text_block(json.dumps(item))]}
@@ -1093,6 +1094,9 @@ class AnthropicMessagesToolResponseAdapter(ToolResponseAdapter):
             return response.name
         if isinstance(response, EmptyContent):
             return "ok"
+        if isinstance(response, ErrorContent):
+            code = f" (code={response.code})" if response.code is not None else ""
+            return f"Error{code}: {response.text}"
         if isinstance(response, dict):
             return json.dumps(response)
         if isinstance(response, str):
@@ -2302,7 +2306,6 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
                         name=toolkit.name,
                         title=toolkit.title,
                         description=toolkit.description,
-                        thumbnail_url=toolkit.thumbnail_url,
                         rules=[*toolkit.rules],
                         tools=executable_tools,
                     )
@@ -2691,16 +2694,21 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
 
                     async def do_tool(tool_use: dict) -> list[dict]:
                         tool_use_id = tool_use.get("id")
-                        caller_context = context.to_tool_caller_context(
-                            item_id=tool_use_id
-                            if isinstance(tool_use_id, str)
-                            else None
+                        tool_item_id = (
+                            tool_use_id if isinstance(tool_use_id, str) else None
                         )
+
+                        def handle_tool_event(event: dict):
+                            if event_handler is None:
+                                return
+                            if tool_item_id is not None and "item_id" not in event:
+                                event = {**event, "item_id": tool_item_id}
+                            event_handler(event)
+
                         tool_context = ToolContext(
                             caller=caller,
                             on_behalf_of=on_behalf_of,
-                            caller_context=caller_context,
-                            event_handler=event_handler,
+                            event_handler=handle_tool_event,
                         )
                         try:
                             if event_handler is not None:
