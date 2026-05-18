@@ -8,11 +8,14 @@ import httpx
 from anthropic import APIConnectionError, APIStatusError
 
 from meshagent.agents.messages import (
+    AGENT_EVENT_IMAGE_GENERATION_COMPLETED,
     AGENT_EVENT_TEXT_CONTENT_DELTA,
     AGENT_EVENT_TEXT_CONTENT_ENDED,
     AGENT_EVENT_TOOL_CALL_ARGUMENTS_DELTA,
     AGENT_EVENT_TOOL_CALL_ENDED,
     AGENT_EVENT_TOOL_CALL_STARTED,
+    AgentGeneratedImage,
+    AgentImageGenerationCompleted,
     AgentFileContentDelta,
     AgentFileContentEnded,
     AgentFileContentStarted,
@@ -46,6 +49,14 @@ from meshagent.agents.context import SessionUsage
 from meshagent.api.messaging import FileContent, JsonContent, TextContent
 from meshagent.tools import FunctionTool, Toolkit, ToolContext
 from meshagent.api import RoomException
+
+
+def test_list_models_advertises_attachment_capabilities() -> None:
+    model = AnthropicMessagesAdapter(model="claude-3-5-sonnet-latest").list_models()[0]
+
+    assert model.supports_attachments is True
+    assert "image/png" in model.accepts
+    assert "application/pdf" in model.accepts
 
 
 class _DummyParticipant:
@@ -113,6 +124,65 @@ def test_make_agent_event_reader_accumulates_streamed_text_for_restore() -> None
     assert context.messages == [
         {"role": "assistant", "content": [{"type": "text", "text": "Hi there"}]}
     ]
+
+
+def test_make_agent_event_reader_restores_image_generation_with_turn_id() -> None:
+    adapter = AnthropicMessagesAdapter(model="claude-sonnet-4-6", client=object())
+    context = adapter.create_session()
+    restored_messages: list[dict[str, Any]] = []
+    reader = adapter.make_agent_event_reader(emit_message=restored_messages.append)
+
+    reader.consume(
+        AgentImageGenerationCompleted(
+            type=AGENT_EVENT_IMAGE_GENERATION_COMPLETED,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            item_id="image-1",
+            call_id="call-image",
+            toolkit="openai",
+            tool="image_generation",
+            arguments={"size": "512x512"},
+            images=[
+                AgentGeneratedImage(
+                    uri="data:image/png;base64,aW1hZ2U=",
+                    mime_type="image/png",
+                    width=512,
+                    height=512,
+                    status="completed",
+                )
+            ],
+        )
+    )
+    reader.finalize()
+    adapter.restore_context_messages(context=context, messages=restored_messages)
+
+    assert len(context.messages) == 1
+    assert context.messages[0]["role"] == "assistant"
+    assert len(context.messages[0]["content"]) == 1
+    block = context.messages[0]["content"][0]
+    assert block["type"] == "text"
+    assert json.loads(block["text"]) == {
+        "type": "image_generation",
+        "event_type": AGENT_EVENT_IMAGE_GENERATION_COMPLETED,
+        "turn_id": "turn-1",
+        "item_id": "image-1",
+        "call_id": "call-image",
+        "toolkit": "openai",
+        "tool": "image_generation",
+        "arguments": {"size": "512x512"},
+        "images": [
+            {
+                "uri": "data:image/png;base64,aW1hZ2U=",
+                "mime_type": "image/png",
+                "created_at": None,
+                "created_by": None,
+                "width": 512,
+                "height": 512,
+                "status": "completed",
+            }
+        ],
+        "status": "completed",
+    }
 
 
 @pytest.mark.parametrize(
@@ -519,18 +589,18 @@ class _AnyArgsTool(FunctionTool):
         return {"ok": True, "args": kwargs}
 
 
-class _CallerContextTool(FunctionTool):
+class _ContextTool(FunctionTool):
     def __init__(self, name: str):
         super().__init__(
             name=name,
             input_schema={"type": "object", "additionalProperties": True},
-            description="caller context test tool",
+            description="context test tool",
         )
-        self.caller_contexts: list[dict[str, Any] | None] = []
+        self.contexts: list[ToolContext] = []
 
     async def execute(self, context: ToolContext, **kwargs):
         del kwargs
-        self.caller_contexts.append(context.caller_context)
+        self.contexts.append(context)
         return {"ok": True}
 
 
@@ -1016,8 +1086,8 @@ async def test_next_batches_multiple_tool_results_into_single_user_message():
 
 
 @pytest.mark.asyncio
-async def test_next_passes_thread_and_turn_ids_in_tool_caller_context():
-    tool = _CallerContextTool("context_tool")
+async def test_next_passes_typed_tool_context_without_agent_lifecycle_ids():
+    tool = _ContextTool("context_tool")
     responses = [
         {
             "content": [
@@ -1046,13 +1116,10 @@ async def test_next_passes_thread_and_turn_ids_in_tool_caller_context():
     )
 
     assert result == "done"
-    assert len(tool.caller_contexts) == 1
-    caller_context = tool.caller_contexts[0]
-    assert isinstance(caller_context, dict)
-    assert caller_context["thread_id"] == "thread-1"
-    assert caller_context["turn_id"] == "turn-1"
-    assert caller_context["item_id"] == "toolu_1"
-    assert isinstance(caller_context.get("chat"), dict)
+    assert len(tool.contexts) == 1
+    tool_context = tool.contexts[0]
+    assert type(tool_context) is ToolContext
+    assert tool_context.caller.id == _DummyRoom().local_participant.id
 
 
 def test_make_agent_event_publisher_emits_tool_log_delta() -> None:
@@ -2393,6 +2460,52 @@ def test_create_chat_context_supports_remote_image_and_file_urls() -> None:
             "type": "url",
             "url": "https://example.com/report.pdf",
         },
+    }
+
+
+def test_create_chat_context_supports_data_url_text_file() -> None:
+    adapter = AnthropicMessagesAdapter(client=object())
+    context = adapter.create_session()
+
+    message = context.append_file_url(
+        url="data:text/plain;base64,aGVsbG8=", filename="note.txt"
+    )
+
+    assert message["content"][0] == {
+        "type": "text",
+        "text": "attached file note.txt (text/plain):\nhello",
+    }
+
+
+def test_create_chat_context_supports_data_url_image_file() -> None:
+    adapter = AnthropicMessagesAdapter(client=object())
+    context = adapter.create_session()
+
+    message = context.append_file_url(
+        url="data:image/png;base64,cG5n", filename="image.png"
+    )
+
+    assert message["content"][0] == {
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": "image/png",
+            "data": "cG5n",
+        },
+    }
+
+
+def test_create_chat_context_replaces_unsupported_data_url_file_with_note() -> None:
+    adapter = AnthropicMessagesAdapter(client=object())
+    context = adapter.create_session()
+
+    message = context.append_file_url(
+        url="data:application/octet-stream;base64,YmxvYg==", filename="blob.bin"
+    )
+
+    assert message["content"][0] == {
+        "type": "text",
+        "text": "the user attached blob.bin with unsupported mime type application/octet-stream",
     }
 
 

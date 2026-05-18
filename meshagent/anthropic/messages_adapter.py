@@ -22,6 +22,7 @@ from meshagent.api.messaging import (
     JsonContent,
     TextContent,
     EmptyContent,
+    ErrorContent,
     RawOutputsContent,
     ensure_content,
 )
@@ -44,6 +45,7 @@ from meshagent.agents.agent_event_reader import (
 import json
 from typing import Any, Optional, Callable, Literal
 from collections.abc import AsyncIterable, Mapping
+from dataclasses import dataclass
 import os
 import logging
 import re
@@ -52,7 +54,7 @@ import base64
 import mimetypes
 import copy
 from html_to_markdown import convert
-from urllib.parse import urlparse
+from urllib.parse import unquote_to_bytes, urlparse
 
 from meshagent.anthropic.proxy import (
     get_client,
@@ -100,11 +102,61 @@ _ANTHROPIC_STEERING_MARKER = "TURN INTERRUPTED"
 _ANTHROPIC_DEFAULT_MAX_RETRIES = 10
 _ANTHROPIC_DEFAULT_RETRY_BACKOFF_SECONDS = 1.0
 _ANTHROPIC_MAX_RETRY_BACKOFF_SECONDS = 30.0
+_ANTHROPIC_MAX_INLINE_IMAGE_BYTES = 5 * 1024 * 1024
+_ANTHROPIC_MAX_INLINE_PDF_BYTES = 32 * 1024 * 1024
+_ANTHROPIC_MAX_INLINE_TEXT_BYTES = 1 * 1024 * 1024
+_ANTHROPIC_ACCEPTED_ATTACHMENT_TYPES = (
+    "image/jpeg",
+    "image/png",
+    "image/gif",
+    "image/webp",
+    "application/pdf",
+    "text/*",
+    "application/json",
+    "application/xhtml+xml",
+)
 _ANTHROPIC_STEERING_INSTRUCTIONS = (
     "If the transcript contains an assistant message exactly equal to "
     f"'{_ANTHROPIC_STEERING_MARKER}', then treat the immediately following user "
     "message as steering that takes precedence over any unfinished prior plan."
 )
+
+
+@dataclass(frozen=True)
+class _DataUrlAttachment:
+    mime_type: str
+    data: bytes
+
+
+def _decode_data_url_attachment(url: str) -> _DataUrlAttachment | None:
+    if not url.startswith("data:"):
+        return None
+    header, separator, payload = url[5:].partition(",")
+    if separator == "":
+        return None
+
+    parts = [part.strip() for part in header.split(";") if part.strip()]
+    mime_type = "text/plain"
+    parameter_parts = parts
+    if parts and "/" in parts[0]:
+        mime_type = parts[0].lower()
+        parameter_parts = parts[1:]
+
+    is_base64 = False
+    for part in parameter_parts:
+        lower = part.lower()
+        if lower == "base64":
+            is_base64 = True
+
+    try:
+        data = (
+            base64.b64decode(payload, validate=False)
+            if is_base64
+            else unquote_to_bytes(payload)
+        )
+    except Exception:
+        return None
+    return _DataUrlAttachment(mime_type=mime_type, data=data)
 
 
 class _AnthropicToolCallingState:
@@ -488,16 +540,13 @@ class AnthropicMessagesChatContext(AgentSessionContext):
 
         allowed_mime_types = {"image/jpeg", "image/png", "image/gif", "image/webp"}
         if normalized_mime_type not in allowed_mime_types:
-            message = {
-                "role": "user",
-                "content": [
-                    _text_block(
-                        f"the user attached an image in unsupported format {normalized_mime_type}"
-                    )
-                ],
-            }
-            self.messages.append(message)
-            return message
+            return self._append_attachment_note(
+                f"the user attached an image in unsupported format {normalized_mime_type}"
+            )
+        if len(data) > _ANTHROPIC_MAX_INLINE_IMAGE_BYTES:
+            return self._append_attachment_note(
+                f"the user attached an image ({normalized_mime_type}) that was too large to include"
+            )
 
         message = {
             "role": "user",
@@ -516,6 +565,12 @@ class AnthropicMessagesChatContext(AgentSessionContext):
         return message
 
     def append_image_url(self, *, url: str) -> dict:
+        data_url = _decode_data_url_attachment(url)
+        if data_url is not None:
+            return self.append_image_message(
+                mime_type=data_url.mime_type,
+                data=data_url.data,
+            )
         message = {
             "role": "user",
             "content": [
@@ -543,6 +598,10 @@ class AnthropicMessagesChatContext(AgentSessionContext):
             )
 
         if normalized_mime_type == "application/pdf":
+            if len(data) > _ANTHROPIC_MAX_INLINE_PDF_BYTES:
+                return self._append_attachment_note(
+                    f"the user attached {filename} ({normalized_mime_type}) but it was too large to include"
+                )
             message = {
                 "role": "user",
                 "content": [
@@ -565,6 +624,10 @@ class AnthropicMessagesChatContext(AgentSessionContext):
             or normalized_mime_type == "application/json"
             or normalized_mime_type == "application/xhtml+xml"
         ):
+            if len(data) > _ANTHROPIC_MAX_INLINE_TEXT_BYTES:
+                return self._append_attachment_note(
+                    f"the user attached {filename} ({normalized_mime_type}) but it was too large to include"
+                )
             if _is_html_mime_type(normalized_mime_type):
                 text = convert(_decode_text(data))
             else:
@@ -581,18 +644,19 @@ class AnthropicMessagesChatContext(AgentSessionContext):
             self.messages.append(message)
             return message
 
-        message = {
-            "role": "user",
-            "content": [
-                _text_block(
-                    f"the user attached a file named {filename} with mime type {normalized_mime_type}"
-                )
-            ],
-        }
-        self.messages.append(message)
-        return message
+        return self._append_attachment_note(
+            f"the user attached {filename} with unsupported mime type {normalized_mime_type}"
+        )
 
-    def append_file_url(self, *, url: str) -> dict:
+    def append_file_url(self, *, url: str, filename: str | None = None) -> dict:
+        data_url = _decode_data_url_attachment(url)
+        if data_url is not None:
+            return self.append_file_message(
+                filename=filename or "attachment",
+                mime_type=data_url.mime_type,
+                data=data_url.data,
+            )
+
         parsed_url = urlparse(url)
         guessed_mime_type, _ = mimetypes.guess_type(parsed_url.path)
         normalized_mime_type = (guessed_mime_type or "application/octet-stream").lower()
@@ -625,6 +689,11 @@ class AnthropicMessagesChatContext(AgentSessionContext):
         self.messages.append(message)
         return message
 
+    def _append_attachment_note(self, text: str) -> dict:
+        message = {"role": "user", "content": [_text_block(text)]}
+        self.messages.append(message)
+        return message
+
 
 class AnthropicMessagesAgentEventReader(AccumulatingAgentEventReader):
     def _append_user_text(self, text: str) -> None:
@@ -641,7 +710,84 @@ class AnthropicMessagesAgentEventReader(AccumulatingAgentEventReader):
             elif item_type == "file":
                 url = item.get("url")
                 if isinstance(url, str):
-                    blocks.append(_text_block(f"the user attached a file: {url}"))
+                    name_value = item.get("name")
+                    filename = (
+                        name_value.strip()
+                        if isinstance(name_value, str) and name_value.strip() != ""
+                        else "attachment"
+                    )
+                    data_url = _decode_data_url_attachment(url)
+                    if data_url is None:
+                        blocks.append(_text_block(f"the user attached a file: {url}"))
+                        continue
+
+                    normalized_mime_type = (
+                        (data_url.mime_type or "application/octet-stream")
+                        .lower()
+                        .strip()
+                    )
+                    if normalized_mime_type.startswith("image/"):
+                        blocks.append(
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": normalized_mime_type,
+                                    "data": base64.b64encode(data_url.data).decode(
+                                        "utf-8"
+                                    ),
+                                },
+                            }
+                        )
+                    elif normalized_mime_type == "application/pdf":
+                        if len(data_url.data) > _ANTHROPIC_MAX_INLINE_PDF_BYTES:
+                            blocks.append(
+                                _text_block(
+                                    f"the user attached {filename} ({normalized_mime_type}) but it was too large to include"
+                                )
+                            )
+                        else:
+                            blocks.append(
+                                {
+                                    "type": "document",
+                                    "title": filename,
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": normalized_mime_type,
+                                        "data": base64.b64encode(data_url.data).decode(
+                                            "utf-8"
+                                        ),
+                                    },
+                                }
+                            )
+                    elif (
+                        normalized_mime_type.startswith("text/")
+                        or normalized_mime_type == "application/json"
+                        or normalized_mime_type == "application/xhtml+xml"
+                    ):
+                        if len(data_url.data) > _ANTHROPIC_MAX_INLINE_TEXT_BYTES:
+                            blocks.append(
+                                _text_block(
+                                    f"the user attached {filename} ({normalized_mime_type}) but it was too large to include"
+                                )
+                            )
+                        else:
+                            text = (
+                                convert(_decode_text(data_url.data))
+                                if _is_html_mime_type(normalized_mime_type)
+                                else _decode_text(data_url.data)
+                            )
+                            blocks.append(
+                                _text_block(
+                                    f"attached file {filename} ({normalized_mime_type}):\n{text}"
+                                )
+                            )
+                    else:
+                        blocks.append(
+                            _text_block(
+                                f"the user attached {filename} with unsupported mime type {normalized_mime_type}"
+                            )
+                        )
         if not blocks:
             blocks.append(_text_block(json.dumps(content)))
         self._emit_context_message({"role": "user", "content": blocks})
@@ -699,6 +845,7 @@ class AnthropicMessagesAgentEventReader(AccumulatingAgentEventReader):
         self,
         *,
         event_type: str,
+        turn_id: str,
         item_id: str,
         call_id: str | None,
         toolkit: str,
@@ -706,11 +853,11 @@ class AnthropicMessagesAgentEventReader(AccumulatingAgentEventReader):
         arguments: dict[str, Any] | None,
         images: list[dict[str, Any]],
         status: str,
-        status_detail: str | None,
     ) -> None:
         item = {
             "type": "image_generation",
             "event_type": event_type,
+            "turn_id": turn_id,
             "item_id": item_id,
             "call_id": call_id,
             "toolkit": toolkit,
@@ -718,7 +865,6 @@ class AnthropicMessagesAgentEventReader(AccumulatingAgentEventReader):
             "arguments": arguments,
             "images": images,
             "status": status,
-            "status_detail": status_detail,
         }
         self._emit_context_message(
             {"role": "assistant", "content": [_text_block(json.dumps(item))]}
@@ -948,6 +1094,9 @@ class AnthropicMessagesToolResponseAdapter(ToolResponseAdapter):
             return response.name
         if isinstance(response, EmptyContent):
             return "ok"
+        if isinstance(response, ErrorContent):
+            code = f" (code={response.code})" if response.code is not None else ""
+            return f"Error{code}: {response.text}"
         if isinstance(response, dict):
             return json.dumps(response)
         if isinstance(response, str):
@@ -1142,6 +1291,8 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
                 name=name,
                 context_window=int(self.context_window_size(name)),
                 pricing=llm_model_pricing(provider="anthropic", model=name),
+                supports_attachments=True,
+                accepts=_ANTHROPIC_ACCEPTED_ATTACHMENT_TYPES,
             )
             for name in names
         ]
@@ -2155,7 +2306,6 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
                         name=toolkit.name,
                         title=toolkit.title,
                         description=toolkit.description,
-                        thumbnail_url=toolkit.thumbnail_url,
                         rules=[*toolkit.rules],
                         tools=executable_tools,
                     )
@@ -2544,16 +2694,21 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
 
                     async def do_tool(tool_use: dict) -> list[dict]:
                         tool_use_id = tool_use.get("id")
-                        caller_context = context.to_tool_caller_context(
-                            item_id=tool_use_id
-                            if isinstance(tool_use_id, str)
-                            else None
+                        tool_item_id = (
+                            tool_use_id if isinstance(tool_use_id, str) else None
                         )
+
+                        def handle_tool_event(event: dict):
+                            if event_handler is None:
+                                return
+                            if tool_item_id is not None and "item_id" not in event:
+                                event = {**event, "item_id": tool_item_id}
+                            event_handler(event)
+
                         tool_context = ToolContext(
                             caller=caller,
                             on_behalf_of=on_behalf_of,
-                            caller_context=caller_context,
-                            event_handler=event_handler,
+                            event_handler=handle_tool_event,
                         )
                         try:
                             if event_handler is not None:
