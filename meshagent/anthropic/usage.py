@@ -61,16 +61,22 @@ def split_anthropic_usage_by_tier(
             + float(current.get("cache_read_input_tokens", 0))
         )
 
-    tiered_prefixes = (
-        "claude-opus-4-7",
-        "claude-opus-4-6",
-        "claude-sonnet-4-6",
+    normalized_model = model.strip().lower()
+    premium_long_context_exact_models = frozenset(
+        {
+            "claude-sonnet-4",
+        }
+    )
+    premium_long_context_prefixes = (
         "claude-sonnet-4-5",
-        "claude-sonnet-4",
         "claude-sonnet-4-0",
+        "claude-sonnet-4-20250514",
     )
 
-    if not model.startswith(tiered_prefixes):
+    if (
+        normalized_model not in premium_long_context_exact_models
+        and not normalized_model.startswith(premium_long_context_prefixes)
+    ):
         return dict(usage)
 
     if total_input_tokens(usage) <= 200_000:
