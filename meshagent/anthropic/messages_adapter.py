@@ -997,7 +997,10 @@ class MessagesToolBundle:
     def get_tool(self, safe_name: str) -> FunctionTool | None:
         return self._tools_by_safe_name.get(safe_name)
 
-    def resolve_function_tool_name(self, safe_name: str) -> tuple[str, str] | None:
+    def resolve_function_tool_name(
+        self, safe_name: str, namespace: str | None
+    ) -> tuple[str, str] | None:
+        del namespace
         original_name = self._safe_names.get(safe_name)
         if original_name is None:
             return None
