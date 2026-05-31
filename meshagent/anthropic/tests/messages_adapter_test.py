@@ -1481,6 +1481,7 @@ def test_default_max_tokens_for_model_uses_model_family_defaults() -> None:
     assert _default_max_tokens_for_model("claude-sonnet-4-6") == 64_000
     assert _default_max_tokens_for_model("claude-sonnet-4-5") == 64_000
     assert _default_max_tokens_for_model("claude-3-7-sonnet-latest") == 64_000
+    assert _default_max_tokens_for_model("claude-opus-4-8") == 128_000
     assert _default_max_tokens_for_model("claude-opus-4-7") == 128_000
     assert _default_max_tokens_for_model("claude-opus-4-6") == 128_000
     assert _default_max_tokens_for_model("claude-opus-4-1") == 32_000
