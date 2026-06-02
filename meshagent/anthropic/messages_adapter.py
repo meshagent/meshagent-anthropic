@@ -800,7 +800,13 @@ class AnthropicMessagesAgentEventReader(AccumulatingAgentEventReader):
             {"role": "assistant", "content": [_text_block(text)]}
         )
 
-    def _append_assistant_reasoning(self, *, text: str) -> None:
+    def _append_assistant_reasoning(
+        self,
+        *,
+        text: str,
+        metadata: dict[str, Any],
+    ) -> None:
+        del metadata
         self._emit_context_message(
             {"role": "assistant", "content": [_text_block(f"Reasoning: {text}")]}
         )
@@ -1431,6 +1437,8 @@ class AnthropicMessagesAdapter(LLMAdapter[dict]):
             thread_id=thread_id,
             callback=callback,
             custom_event_callback=custom_event_callback,
+            provider=self._provider,
+            model=self._model,
         )
 
     def _set_function_tool_name_resolver(
